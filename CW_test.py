@@ -50,7 +50,9 @@ Dmax = 75.0 * Ns / BW
 dist_axis = np.linspace(0, Dmax, N_FFT // 2, endpoint=False)
 
 k_min = 2  # éviter DC
-ROI_MIN, ROI_MAX = 0.30, 3.50  # zone humaine typique (à adapter)
+
+# ROI humaine (à adapter à ton usage)
+ROI_MIN, ROI_MAX = 0.30, 3.50
 roi_mask = (dist_axis >= ROI_MIN) & (dist_axis <= ROI_MAX)
 
 # --- Clutter map (suppression statique range-domain) ---
@@ -63,6 +65,10 @@ alpha_track = 0.15       # filtre IIR sur la distance
 gate_m = 0.8             # recherche pic dans ± gate_m autour de R_track quand lock
 lock_hold_s = 1.0        # tolérance de perte avant reset
 last_lock_time = None
+
+# --- Sélection cible (anti multipath dominant) ---
+w_d = 3.0  # pénalité distance dans le score (augmente si ça saute vers un écho lointain)
+min_rel_peak = 0.30  # au premier lock, la détection doit être >= 30% du max candidat pour être considérée "robuste"
 
 # --- CFAR 1D ---
 GUARD = 4
@@ -88,10 +94,6 @@ def ca_cfar_1d(power, guard=4, train=16, scale=6.0):
 # FIR bandpass (fenêtre Hann) pour vital signs
 # =========================
 def fir_bandpass(fs, f1, f2, numtaps=401):
-    """
-    Filtre FIR passe-bande par sinc fenêtrée.
-    fs en Hz, f1<f2 en Hz.
-    """
     f1 = max(f1, 1e-6)
     f2 = min(f2, 0.499 * fs)
     n = np.arange(numtaps) - (numtaps - 1) / 2
@@ -100,33 +102,27 @@ def fir_bandpass(fs, f1, f2, numtaps=401):
     h = h2 - h1
     w = np.hanning(numtaps)
     h *= w
-    h /= np.sum(h + 1e-12)  # normalisation grossière (DC pas critique ici)
+    # normalisation énergie approximative
+    h /= (np.sum(np.abs(h)) + 1e-12)
     return h
 
 def apply_fir(x, h):
-    # convolution "same"
     return np.convolve(x, h, mode="same")
 
 def dominant_freq_hz(x, fs, fmin, fmax):
-    """
-    Pic spectral dans [fmin, fmax] via FFT.
-    """
     x = np.asarray(x, dtype=np.float64)
     x = x - np.mean(x)
-    if len(x) < 16:
+    if len(x) < 32:
         return None
-
     w = np.hanning(len(x))
     X = np.fft.rfft(x * w)
-    f = np.fft.rfftfreq(len(x), d=1.0/fs)
-    P = np.abs(X)**2
-
+    f = np.fft.rfftfreq(len(x), d=1.0 / fs)
+    P = np.abs(X) ** 2
     band = (f >= fmin) & (f <= fmax)
     if not np.any(band):
         return None
-
     k = np.argmax(P[band])
-    return f[band][k]
+    return float(f[band][k])
 
 # =========================
 # Buffers vital signs
@@ -134,19 +130,13 @@ def dominant_freq_hz(x, fs, fmin, fmax):
 phase_buf = []
 t_buf = []
 
-# Fenêtres d'analyse (tu peux ajuster)
-WIN_S = 30.0   # secondes (resp OK à 20-30s, coeur mieux 30-45s)
-MIN_S = 15.0   # ne pas estimer avant
-
-# =========================
-# Boucle acquisition
-# =========================
-t0 = time.time()
-t_prev = None
+WIN_S = 30.0   # secondes (augmente à 45-60s pour améliorer HR)
+MIN_S = 15.0
 
 print("Démarrage... Ctrl+C pour arrêter.")
 
 try:
+    t_prev = None
     while True:
         rc, results, raw = uRAD_RP_SDK11.detection()
         if rc != 0:
@@ -163,12 +153,10 @@ try:
         Q = np.asarray(raw[1], dtype=np.float64)
 
         # Chirp UP uniquement
-        I_up = I[:Ns]
-        Q_up = Q[:Ns]
-        s_up = (I_up + 1j * Q_up)
+        s_up = (I[:Ns] + 1j * Q[:Ns])
 
         # Preproc
-        s_up = s_up - np.mean(s_up)     # DC removal
+        s_up = s_up - np.mean(s_up)
         s_up = s_up * window
 
         # Range FFT
@@ -180,7 +168,7 @@ try:
         mag_mti = mag - clutter
         mag_mti[mag_mti < 0] = 0.0
 
-        power = mag_mti**2
+        power = mag_mti ** 2
 
         # ROI humaine
         power_roi = power.copy()
@@ -189,7 +177,7 @@ try:
         # Gate autour du tracking si lock
         if R_track is not None:
             gate = (dist_axis >= (R_track - gate_m)) & (dist_axis <= (R_track + gate_m))
-            power_roi = power_roi * gate
+            power_roi *= gate
 
         # CFAR
         det, thr = ca_cfar_1d(power_roi, guard=GUARD, train=TRAIN, scale=SCALE)
@@ -201,20 +189,29 @@ try:
             if last_lock_time is not None and (now - last_lock_time) > lock_hold_s:
                 R_track = None
                 last_lock_time = None
-                # reset buffers vital si on perd la cible
                 phase_buf.clear()
                 t_buf.clear()
             print("No reliable detection (CFAR).")
             continue
 
-        # Choix du pic : ici on prend le plus fort dans ROI (+ gate)
-        k_peak = cand[np.argmax(power_roi[cand])]
-        R_meas = dist_axis[k_peak]
-
-        # Tracking
+        # =========================
+        # Choix du bin cible (correction anti multipath)
+        # =========================
         if R_track is None:
+            # Premier lock: privilégier la cible la plus proche mais "robuste"
+            cand_sorted = cand[np.argsort(dist_axis[cand])]
+            pmax = np.max(power_roi[cand_sorted])
+            good = cand_sorted[power_roi[cand_sorted] > (min_rel_peak * pmax)]
+            k_peak = int(good[0] if good.size else cand_sorted[0])
+            R_meas = float(dist_axis[k_peak])
             R_track = R_meas
         else:
+            # Lock existant: score puissance - pénalité distance à R_track
+            d = np.abs(dist_axis[cand] - R_track)
+            p = power_roi[cand] / (np.max(power_roi[cand]) + 1e-12)
+            score = p - w_d * (d / (gate_m + 1e-6))
+            k_peak = int(cand[np.argmax(score)])
+            R_meas = float(dist_axis[k_peak])
             R_track = (1 - alpha_track) * R_track + alpha_track * R_meas
 
         last_lock_time = now
@@ -222,59 +219,61 @@ try:
         # =========================
         # Vital signs: phase au bin suivi
         # =========================
-        # On prend la valeur complexe S[k_peak] (chirp UP), phase -> micro-mouvements
         z = S[k_peak]
-        phi = np.angle(z)
+        phi = float(np.angle(z))
 
-        # Buffer temporel
         phase_buf.append(phi)
         t_buf.append(now)
 
-        # Garder ~ WIN_S secondes
+        # garder WIN_S secondes
         while (t_buf[-1] - t_buf[0]) > WIN_S:
             phase_buf.pop(0)
             t_buf.pop(0)
 
-        # Estimation FS (fréq d'échantillonnage) via timestamps
         duration = t_buf[-1] - t_buf[0]
         n = len(t_buf)
         fs = (n - 1) / duration if duration > 1e-6 else None
 
-        # Unwrap phase + dérive lente (detrend simple)
-        resp_bpm = None
-        hr_bpm = None
+        resp_rpm = None   # respiration rate per minute
+        hr_bpm = None     # heart rate beats per minute
 
         if fs is not None and duration >= MIN_S and n > 64:
             ph = np.unwrap(np.array(phase_buf, dtype=np.float64))
-            ph = ph - np.mean(ph)
+            ph -= np.mean(ph)
 
-            # Detrend très simple : enlever une droite (évite drift)
+            # detrend linéaire (drift)
             tt = np.array(t_buf, dtype=np.float64)
-            tt = tt - tt[0]
+            tt -= tt[0]
             A = np.vstack([tt, np.ones_like(tt)]).T
             m, c = np.linalg.lstsq(A, ph, rcond=None)[0]
             ph_d = ph - (m * tt + c)
 
-            # Respiration: ~0.1 à 0.6 Hz (6 à 36 bpm)
+            # Respiration: 0.10–0.60 Hz => 6–36 rpm
             h_resp = fir_bandpass(fs, 0.10, 0.60, numtaps=301)
             resp_sig = apply_fir(ph_d, h_resp)
             f_resp = dominant_freq_hz(resp_sig, fs, 0.10, 0.60)
             if f_resp is not None:
-                resp_bpm = 60.0 * f_resp
+                resp_rpm = 60.0 * f_resp
 
-            # Coeur: ~0.8 à 3.0 Hz (48 à 180 bpm)
-            # (souvent faible -> fenêtre plus longue aide)
+            # Heart: 0.80–3.00 Hz => 48–180 bpm
             h_hr = fir_bandpass(fs, 0.80, 3.00, numtaps=401)
             hr_sig = apply_fir(ph_d, h_hr)
             f_hr = dominant_freq_hz(hr_sig, fs, 0.80, 3.00)
             if f_hr is not None:
                 hr_bpm = 60.0 * f_hr
 
+        # =========================
         # Affichage
-        if resp_bpm is None and hr_bpm is None:
-            print(f"R_track={R_track:.2f} m | (collecting) buf={len(phase_buf)} dur={duration:.1f}s")
+        # =========================
+        peak_db = 10.0 * np.log10(power_roi[k_peak] + 1e-12)
+
+        if resp_rpm is None and hr_bpm is None:
+            print(f"R_track={R_track:.2f} m | peak={peak_db:.1f} dB | collecting buf={n} dur={duration:.1f}s")
         else:
-            print(f"R_track={R_track:.2f} m | Resp={resp_bpm:.1f} bpm | HR={hr_bpm:.1f} bpm | fs~{fs:.1f} Hz")
+            # Respiration en rpm (respirations/min), coeur en bpm
+            print(
+                f"R_track={R_track:.2f} m | Resp={resp_rpm:.1f} rpm | HR={hr_bpm:.1f} bpm | fs~{fs:.1f} Hz | peak={peak_db:.1f} dB"
+            )
 
 except KeyboardInterrupt:
     closeProgram()
