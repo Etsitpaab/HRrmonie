@@ -357,6 +357,7 @@ try:
                 hr_out = hr_val[-1] if hr_val.size else np.nan
 
                 print(f"RR: {rr_out:.2f} rpm, HR: {hr_out:.2f} bpm")
+                print(f"f HR détectée: {f_tr[~np.isnan(f_tr)][-1] if np.any(~np.isnan(f_tr)) else np.nan}")
                 marqueur_print = t_now
 
 except KeyboardInterrupt:
