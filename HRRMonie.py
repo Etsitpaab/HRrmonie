@@ -4,7 +4,7 @@ import numpy as np
 from scipy.signal import butter, sosfiltfilt, find_peaks, get_window
 import uRAD_RP_SDK11
 import matplotlib.pyplot as plt
-import props
+#import props
 from collections import deque
 # -------------------------
 # Configuration radar uRAD
@@ -146,7 +146,7 @@ def puissance_spectre(x,freq,nfft=None, window="hann"):
     frequence = np.fft.rfftfreq(nfft, d=1.0/freq)
 
     return frequence, Pxx
-
+"""
 def qualite_pics(frequence, Pxx, min, max):
     bande = (frequence >= min) & (frequence <= max)
     frequence_bande = frequence[bande]
@@ -173,6 +173,37 @@ def qualite_pics(frequence, Pxx, min, max):
     prominence_norm = float(prom / (pic_pow + 1e-12))
 
     return frequence_pic, SNR_db, prominence_norm
+"""
+def qualite_pics(frequence, Pxx, fmin, fmax):
+    bande = (frequence >= fmin) & (frequence <= fmax)
+    frequence_bande = frequence[bande]
+    Pxx_bande = Pxx[bande]
+
+    if Pxx_bande.size == 0:
+        return np.nan, np.nan, 0.0
+
+    pics, propriete = find_peaks(Pxx_bande, prominence=0.1 * np.max(Pxx_bande))
+
+    bruit = np.median(Pxx_bande) + 1e-12
+
+    if len(pics) == 0:
+        k = int(np.argmax(Pxx_bande))
+        frequence_pic = frequence_bande[k]
+        pic_pow = Pxx_bande[k] + 1e-12
+        SNR_db = 10.0 * np.log10(pic_pow / bruit)
+        return frequence_pic, SNR_db, 0.0
+
+    k0 = pics[np.argmax(Pxx_bande[pics])]
+    frequence_pic = frequence_bande[k0]
+    pic_pow = Pxx_bande[k0] + 1e-12
+    SNR_db = 10.0 * np.log10(pic_pow / bruit)
+
+    prominences = propriete["prominences"]
+    prom = float(prominences[np.argmax(Pxx_bande[pics])])
+    prominence_norm = prom / pic_pow
+
+    return frequence_pic, SNR_db, prominence_norm
+
 
 def FFT_glissante(x, freq, freq_min, freq_max, duree_fenetre=20.0):
     x = np.asarray(x, dtype=np.float64)
