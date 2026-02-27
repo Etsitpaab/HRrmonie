@@ -48,8 +48,8 @@ if return_code != 0:
 
 # Fonction du pipeline de traitement du signal radar
 
-beta_dc = 0.005
-beta_variance = 0.01
+beta_dc = 0.001
+beta_variance = 0.001
 epsilon = 1e-6
 
 moyenne_I = None
@@ -86,23 +86,22 @@ phase_deplie = 0.0
 phase_precedente = None
 
 
-def unwrap_phase(phase_actuel): #Etape 2
+def unwrap_phase(phase_actuelle):
     global phase_deplie, phase_precedente
-
     if phase_precedente is None:
-        phase_precedente = phase_actuel
-        phase_deplie = phase_actuel
+        phase_precedente = phase_actuelle
+        phase_deplie = phase_actuelle
         return phase_deplie
-    
-    delta = phase_actuel - phase_precedente
+
+    delta = phase_actuelle - phase_precedente
 
     if delta > np.pi:
-        phase_deplie -= 2*np.pi
+        delta -= 2*np.pi
     elif delta < -np.pi:
-        phase_deplie += 2*np.pi
+        delta += 2*np.pi
 
-    phase_deplie +=delta
-    phase_precedente = phase_actuel
+    phase_deplie += delta
+    phase_precedente = phase_actuelle
     return phase_deplie
 
 def filtre_pass_haut(phase_signal, freq_echanti): # Etape 3 
@@ -134,18 +133,17 @@ def passe_bande(phase_signal, f_basse, f_haut, freq_echanti): # Etape 4
 
     return signal_filtre
 
-def puissance_spectre(x,freq,nfft=None, window="hann"):
+def puissance_spectre(x, fs, nfft=None, window="hann"):
     x = np.asarray(x, dtype=np.float64)
     N = x.size
     if nfft is None:
-        nfft = int(2 - np.ceil(np.log2(N)))
+        nfft = int(2 ** np.ceil(np.log2(max(N, 1))))
     w = get_window(window, N)
-    fenetre_x = (x - np.mean(x)) * w
-    X = np.fft.rfft(fenetre_x, n=nfft)
-    Pxx = np.abs(X)**2
-    frequence = np.fft.rfftfreq(nfft, d=1.0/freq)
-
-    return frequence, Pxx
+    xw = (x - np.mean(x)) * w
+    X = np.fft.rfft(xw, n=nfft)
+    Pxx = (np.abs(X) ** 2)
+    f = np.fft.rfftfreq(nfft, d=1.0 / fs)
+    return f, Pxx
 """
 def qualite_pics(frequence, Pxx, min, max):
     bande = (frequence >= min) & (frequence <= max)
@@ -285,6 +283,9 @@ buffer_phi = deque()
 
 marqueur_print = time.time()
 
+fs_est = None
+beta_fs = 0.05
+
 try:
     while True:
         code_erreur, resultat, tableau_IQ = uRAD_RP_SDK11.detection()
@@ -292,40 +293,61 @@ try:
             closeProgram()
             break
         
-        # Pipeline etape 1
+        # -----------------------
+        # Pipeline étape 1
+        # -----------------------
         I_brut = tableau_IQ[0]
         Q_brut = tableau_IQ[1]
 
         I_moyenne = np.mean(I_brut)
         Q_moyenne = np.mean(Q_brut)
 
-        z = I_moyenne + 1j * Q_moyenne
-
-        I_n, Q_n = pretraitement(I_moyenne, Q_moyenne) 
+        I_n, Q_n = pretraitement(I_moyenne, Q_moyenne)
 
         phase = np.arctan2(Q_n, I_n)
-        phase_deplie = unwrap_phase(phase)
+        phase_deplie_val = unwrap_phase(phase)
 
         t_now = time.time()
         buffer_temps.append(t_now)
-        buffer_phi.append(phase_deplie)
+        buffer_phi.append(phase_deplie_val)
 
+        # -----------------------
+        # Estimation fs lissée (EMA)
+        # -----------------------
+        if len(buffer_temps) >= 2:
+            dt_last = buffer_temps[-1] - buffer_temps[-2]
+            fs_inst = 1.0 / max(dt_last, 1e-6)
+            fs_est = fs_inst if fs_est is None else (1 - beta_fs) * fs_est + beta_fs * fs_inst
+
+        # -----------------------
+        # Fenêtre glissante temporelle
+        # -----------------------
         while (buffer_temps[-1] - buffer_temps[0]) > seconde_fenetre:
             buffer_temps.popleft()
             buffer_phi.popleft()
         
-        if (len(buffer_phi)>= echantillon_min):
-            tab_t = np.array(buffer_temps, dtype=np.float64)
+        # -----------------------
+        # Traitement si assez d’échantillons
+        # -----------------------
+        if len(buffer_phi) >= echantillon_min:
+
             tab_phi = np.array(buffer_phi, dtype=np.float64)
 
-            dt = np.diff(tab_t)
-            fs = 1.0 / np.median(dt)
+            # On utilise fs lissé si dispo
+            if fs_est is not None:
+                fs = fs_est
+            else:
+                tab_t = np.array(buffer_temps, dtype=np.float64)
+                dt = np.diff(tab_t)
+                fs = 1.0 / np.median(dt)
+
             phi_passe_haut = filtre_pass_haut(tab_phi, fs)
 
             sig_rr = passe_bande(phi_passe_haut, 0.10, 0.50, fs)
-            sig_hr = passe_bande(phi_passe_haut, 0.80,2.50, fs)
+            sig_hr = passe_bande(phi_passe_haut, 0.80, 2.50, fs)
 
-            if(t_now - marqueur_print ) > affichage: 
+            if (t_now - marqueur_print) > affichage:
+
                 t_rr, rr_rpm, rr_snr, rr_prom = estimation_rr(sig_rr, fs, duree_fenetre=20.0)
                 rr_val = rr_rpm[~np.isnan(rr_rpm)]
                 rr_out = rr_val[-1] if rr_val.size else np.nan
