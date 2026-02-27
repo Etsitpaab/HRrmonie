@@ -4,8 +4,8 @@ import numpy as np
 from scipy.signal import butter, sosfiltfilt, find_peaks, get_window
 import uRAD_RP_SDK11
 import matplotlib.pyplot as plt
-#import props
 from collections import deque
+
 # -------------------------
 # Configuration radar uRAD
 # -------------------------
@@ -13,7 +13,7 @@ mode = 1
 f0 = 125
 BW = 240
 Ns = 200
-Ntar = 3 # 1 à 5
+Ntar = 1 # 1 à 5
 Rmax = 100
 MTI = 0
 Mth = 0
@@ -25,9 +25,6 @@ SNR_true = False
 I_true = True
 Q_true = True
 movement_true = False
-
-
-
 
 #Code recommandé par Urad
 def closeProgram():
@@ -117,7 +114,6 @@ def filtre_pass_haut(phase_signal, freq_echanti): # Etape 3
     return signal_filtre
 
 def passe_bande(phase_signal, f_basse, f_haut, freq_echanti): # Etape 4
-    #Formule générique
     ordre = 4
 
     signal = np.asarray(phase_signal, dtype=np.float64)
@@ -144,34 +140,8 @@ def puissance_spectre(x, fs, nfft=None, window="hann"):
     Pxx = (np.abs(X) ** 2)
     f = np.fft.rfftfreq(nfft, d=1.0 / fs)
     return f, Pxx
-"""
-def qualite_pics(frequence, Pxx, min, max):
-    bande = (frequence >= min) & (frequence <= max)
-    frequence_bande = frequence[bande]
-    Pxx_bande = Pxx[bande]
 
-    pics, propriete = find_peaks(Pxx_bande, prominence=0.1 * np.max(Pxx_bande))
 
-    if len(pics) == 0:
-        k = int(np.argmax(Pxx_bande))
-        frequence_pic = frequence_bande[k]
-        pic_pow = Pxx_bande[k]
-        bruit = np.median(Pxx_bande)
-        SNR_db = 10 * np.log10(pic_pow + 1e-12)/ (bruit + 1e-12)
-
-        return frequence_pic, SNR_db, 0.0
-    
-    k0 = pics[np.argmax(Pxx_bande[pics])]
-    frequence_pic = frequence_bande[k0]
-    pic_pow = Pxx_bande[k0]
-    bruit = np.median(Pxx_bande)
-    SNR_db = 10 * np.log10(pic_pow + 1e-12) / (bruit + 1e-12)
-    prominences = props["prominences"]
-    prom = prominences[np.argmax(Pxx_bande[pics])]
-    prominence_norm = float(prom / (pic_pow + 1e-12))
-
-    return frequence_pic, SNR_db, prominence_norm
-"""
 def qualite_pics(frequence, Pxx, fmin, fmax):
     bande = (frequence >= fmin) & (frequence <= fmax)
     frequence_bande = frequence[bande]
@@ -269,6 +239,8 @@ def estimation_hr(signal_hr,fs, duree_fenetre=15.0):
     f_tr = tracking_freq(f, snr, prom, saut_max=0.2, alph=0.3)
 
     bpm = f_tr * 60.0
+    
+    print(f"f HR détectée: {f_tr[~np.isnan(f_tr)][-1] if np.any(~np.isnan(f_tr)) else np.nan}")
     return t, bpm, snr, prom
 
 
@@ -296,12 +268,15 @@ try:
         # -----------------------
         # Pipeline étape 1
         # -----------------------
-        I_brut = tableau_IQ[0]
-        Q_brut = tableau_IQ[1]
+        I_brut = np.asarray(tableau_IQ[0],dtype=np.float64)
+        Q_brut = np.asarray(tableau_IQ[1],dtype=np.float64)
 
-        I_moyenne = np.mean(I_brut)
-        Q_moyenne = np.mean(Q_brut)
-
+        z_bin = I_brut + 1j * Q_brut
+        
+        idx = int(np.argmax(np.abs(z_bin)))
+        
+        I_moyenne = float(I_brut[idx])
+        Q_moyenne = float(Q_brut[idx])
         I_n, Q_n = pretraitement(I_moyenne, Q_moyenne)
 
         phase = np.arctan2(Q_n, I_n)
@@ -344,7 +319,7 @@ try:
             phi_passe_haut = filtre_pass_haut(tab_phi, fs)
 
             sig_rr = passe_bande(phi_passe_haut, 0.10, 0.50, fs)
-            sig_hr = passe_bande(phi_passe_haut, 0.80, 2.50, fs)
+            sig_hr = passe_bande(phi_passe_haut, 1.20, 2.20, fs)
 
             if (t_now - marqueur_print) > affichage:
 
@@ -357,7 +332,7 @@ try:
                 hr_out = hr_val[-1] if hr_val.size else np.nan
 
                 print(f"RR: {rr_out:.2f} rpm, HR: {hr_out:.2f} bpm")
-                print(f"f HR détectée: {f_tr[~np.isnan(f_tr)][-1] if np.any(~np.isnan(f_tr)) else np.nan}")
+                
                 marqueur_print = t_now
 
 except KeyboardInterrupt:
