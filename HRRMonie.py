@@ -244,7 +244,24 @@ def estimation_hr(signal_hr,fs, duree_fenetre=15.0):
     return t, bpm, snr, prom
 
 
-#Boucle infinie d'éxecution du radar
+#Boucle infinie d'execution du radar
+plt.ion()  # mode interactif
+
+fig, ax = plt.subplots()
+scatter = ax.scatter([], [], s=8)
+
+ax.set_xlabel("I")
+ax.set_ylabel("Q")
+ax.set_title("Constellation I/Q")
+ax.grid(True)
+ax.set_aspect('equal', adjustable='box')
+
+# bornes fixes (important pour éviter le rescale permanent)
+ax.set_xlim(-2000, 2000)
+ax.set_ylim(-2000, 2000)
+
+
+
 seconde_fenetre = 30.0
 echantillon_min = 200
 affichage = 1.0
@@ -278,6 +295,18 @@ try:
         I_moyenne = float(I_brut[idx])
         Q_moyenne = float(Q_brut[idx])
         I_n, Q_n = pretraitement(I_moyenne, Q_moyenne)
+
+
+        #Graphe de constellation :
+        x = np.array(I_n) + 1j*np.array(Q_n)
+        x = x - np.mean(x)  # suppression offset DC
+
+        # mise à jour des points
+        plt.scatter.set_offsets(np.c_[np.real(x), np.imag(x)])
+
+        plt.fig.canvas.draw()
+        plt.fig.canvas.flush_events()
+        plt.pause(0.001)  # très court, ne bloque pas
 
         phase = np.arctan2(Q_n, I_n)
         phase_deplie_val = unwrap_phase(phase)
