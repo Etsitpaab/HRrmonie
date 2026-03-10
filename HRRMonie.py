@@ -1,5 +1,4 @@
 import time
-import math
 import numpy as np
 from scipy.signal import butter, sosfiltfilt, find_peaks, get_window
 import uRAD_RP_SDK11
@@ -13,7 +12,7 @@ mode = 1
 f0 = 125
 BW = 240
 Ns = 200
-Ntar = 3 # 1 à 5
+Ntar = 3   # 1 à 5
 Rmax = 100
 MTI = 0
 Mth = 0
@@ -26,10 +25,11 @@ I_true = True
 Q_true = True
 movement_true = False
 
-#Code recommandé par Urad
+
 def closeProgram():
     uRAD_RP_SDK11.turnOFF()
     raise SystemExit
+
 
 return_code = uRAD_RP_SDK11.turnON()
 if return_code != 0:
@@ -43,48 +43,84 @@ return_code = uRAD_RP_SDK11.loadConfiguration(
 if return_code != 0:
     closeProgram()
 
-# Fonction du pipeline de traitement du signal radar
 
-beta_dc = 0.001
-beta_variance = 0.001
+# ============================================================
+# 1) Prétraitement pour affichage IQ uniquement
+#    -> conserve ton nuage de constellation propre
+# ============================================================
+beta_dc_iq = 0.001
+beta_variance_iq = 0.001
 epsilon = 1e-6
 
-moyenne_I = None
-moyenne_Q = None
-variance_I = None
-variance_Q = None
+moyenne_I_iq = None
+moyenne_Q_iq = None
+variance_I_iq = None
+variance_Q_iq = None
 
 
-def pretraitement(I_entree,Q_entree): # Etape 2 du pipeline
-
-    global moyenne_I, moyenne_Q, variance_I, variance_Q
+def pretraitement_affichage_iq(I_entree, Q_entree):
+    global moyenne_I_iq, moyenne_Q_iq, variance_I_iq, variance_Q_iq
 
     I_entree = float(I_entree)
     Q_entree = float(Q_entree)
 
-    if moyenne_I is None:
-        moyenne_I, moyenne_Q = I_entree, Q_entree
-        variance_I, variance_Q = 1.0, 1.0
+    if moyenne_I_iq is None:
+        moyenne_I_iq, moyenne_Q_iq = I_entree, Q_entree
+        variance_I_iq, variance_Q_iq = 1.0, 1.0
 
-    moyenne_I = (1 - beta_dc) * moyenne_I + beta_dc * I_entree
-    moyenne_Q = (1 - beta_dc) * moyenne_Q + beta_dc * Q_entree
-    I_centre = I_entree - moyenne_I
-    Q_centre = Q_entree - moyenne_Q
+    moyenne_I_iq = (1 - beta_dc_iq) * moyenne_I_iq + beta_dc_iq * I_entree
+    moyenne_Q_iq = (1 - beta_dc_iq) * moyenne_Q_iq + beta_dc_iq * Q_entree
 
-    variance_I = (1 - beta_variance) * variance_I + beta_variance * (I_centre ** 2)
-    variance_Q = (1 - beta_variance) * variance_Q + beta_variance * (Q_centre ** 2)
+    I_centre = I_entree - moyenne_I_iq
+    Q_centre = Q_entree - moyenne_Q_iq
 
-    I_normalise = I_centre / np.sqrt(variance_I + epsilon)
-    Q_normalise = Q_centre / np.sqrt(variance_Q + epsilon)
+    variance_I_iq = (1 - beta_variance_iq) * variance_I_iq + beta_variance_iq * (I_centre ** 2)
+    variance_Q_iq = (1 - beta_variance_iq) * variance_Q_iq + beta_variance_iq * (Q_centre ** 2)
+
+    I_normalise = I_centre / np.sqrt(variance_I_iq + epsilon)
+    Q_normalise = Q_centre / np.sqrt(variance_Q_iq + epsilon)
 
     return I_normalise, Q_normalise
 
+
+# ============================================================
+# 2) Prétraitement pour la PHASE seulement
+#    -> recentrage DC, sans normalisation séparée I/Q
+# ============================================================
+beta_dc_phase = 0.01
+moyenne_I_phase = None
+moyenne_Q_phase = None
+
+
+def pretraitement_phase(I_entree, Q_entree):
+    global moyenne_I_phase, moyenne_Q_phase
+
+    I_entree = float(I_entree)
+    Q_entree = float(Q_entree)
+
+    if moyenne_I_phase is None:
+        moyenne_I_phase = I_entree
+        moyenne_Q_phase = Q_entree
+
+    moyenne_I_phase = (1 - beta_dc_phase) * moyenne_I_phase + beta_dc_phase * I_entree
+    moyenne_Q_phase = (1 - beta_dc_phase) * moyenne_Q_phase + beta_dc_phase * Q_entree
+
+    I_centre = I_entree - moyenne_I_phase
+    Q_centre = Q_entree - moyenne_Q_phase
+
+    return I_centre, Q_centre
+
+
+# ============================================================
+# 3) Dépliage de phase
+# ============================================================
 phase_deplie = 0.0
 phase_precedente = None
 
 
 def unwrap_phase(phase_actuelle):
     global phase_deplie, phase_precedente
+
     if phase_precedente is None:
         phase_precedente = phase_actuelle
         phase_deplie = phase_actuelle
@@ -93,51 +129,83 @@ def unwrap_phase(phase_actuelle):
     delta = phase_actuelle - phase_precedente
 
     if delta > np.pi:
-        delta -= 2*np.pi
+        delta -= 2 * np.pi
     elif delta < -np.pi:
-        delta += 2*np.pi
+        delta += 2 * np.pi
 
     phase_deplie += delta
     phase_precedente = phase_actuelle
     return phase_deplie
 
-def filtre_pass_haut(phase_signal, freq_echanti): # Etape 3 
-    nyq = freq_echanti / 2
 
-    if 0.05 >= nyq:
-        return phase_signal
-    
-    sos = butter(4, 0.05 / nyq, btype='highpass', output='sos')
+# ============================================================
+# 4) Filtres
+# ============================================================
+def filtre_pass_haut(signal, freq_echanti, fc=0.05):
+    signal = np.asarray(signal, dtype=np.float64)
+    nyq = freq_echanti / 2.0
 
-    signal_filtre = sosfiltfilt(sos,phase_signal)
+    if fc >= nyq:
+        return signal.copy()
 
-    return signal_filtre
+    sos = butter(4, fc / nyq, btype='highpass', output='sos')
+    return sosfiltfilt(sos, signal)
 
-def passe_bande(phase_signal, f_basse, f_haut, freq_echanti): # Etape 4
-    ordre = 4
 
-    signal = np.asarray(phase_signal, dtype=np.float64)
+def passe_bande(signal, f_basse, f_haut, freq_echanti, ordre=4):
+    signal = np.asarray(signal, dtype=np.float64)
+    nyq = freq_echanti / 2.0
 
-    nyq = freq_echanti / 2
+    if f_basse <= 0 or f_haut >= nyq or f_basse >= f_haut:
+        raise ValueError("Bornes de passe-bande invalides.")
 
-    if f_haut >= nyq:
-        raise ValueError("La fréquence de coupure haute doit être inférieure à la moitié de la fréquence d'échantillonnage.")
-    sos=butter(ordre, [f_basse /nyq, f_haut / nyq], 
-               btype='bandpass', output='sos')
+    sos = butter(ordre, [f_basse / nyq, f_haut / nyq], btype='bandpass', output='sos')
+    return sosfiltfilt(sos, signal)
 
-    signal_filtre = sosfiltfilt(sos, signal)
 
-    return signal_filtre
+def notch_resp_harmonics(signal, fs, f_rr, max_harm=6, bw=0.08):
+    """
+    Rejet simple des harmoniques de respiration dans la bande HR.
+    """
+    x = np.asarray(signal, dtype=np.float64).copy()
 
+    if not np.isfinite(f_rr) or f_rr <= 0:
+        return x
+
+    nyq = fs / 2.0
+    for k in range(2, max_harm + 1):
+        f0 = k * f_rr
+        if f0 - bw <= 0:
+            continue
+        if f0 + bw >= nyq:
+            break
+
+        low = max(0.01, f0 - bw)
+        high = min(nyq - 1e-3, f0 + bw)
+
+        try:
+            band = passe_bande(x, low, high, fs, ordre=2)
+            x = x - band
+        except ValueError:
+            pass
+
+    return x
+
+
+# ============================================================
+# 5) Spectre / qualité / tracking
+# ============================================================
 def puissance_spectre(x, fs, nfft=None, window="hann"):
     x = np.asarray(x, dtype=np.float64)
     N = x.size
+
     if nfft is None:
         nfft = int(2 ** np.ceil(np.log2(max(N, 1))))
+
     w = get_window(window, N)
     xw = (x - np.mean(x)) * w
     X = np.fft.rfft(xw, n=nfft)
-    Pxx = (np.abs(X) ** 2)
+    Pxx = np.abs(X) ** 2
     f = np.fft.rfftfreq(nfft, d=1.0 / fs)
     return f, Pxx
 
@@ -151,7 +219,6 @@ def qualite_pics(frequence, Pxx, fmin, fmax):
         return np.nan, np.nan, 0.0
 
     pics, propriete = find_peaks(Pxx_bande, prominence=0.1 * np.max(Pxx_bande))
-
     bruit = np.median(Pxx_bande) + 1e-12
 
     if len(pics) == 0:
@@ -177,11 +244,11 @@ def FFT_glissante(x, freq, freq_min, freq_max, duree_fenetre=20.0):
     x = np.asarray(x, dtype=np.float64)
     N = x.size
     fen = int(round(duree_fenetre * freq))
+
     if fen < 5:
-        raise ValueError("La durée de la fenêtre doit être suffisante pour contenir au moins 5 échantillons.")
-    
-    saut = int(round(fen * (1.0 * 0.5)))
-    hop = max(1, saut)
+        raise ValueError("Fenêtre trop courte.")
+
+    hop = max(1, int(round(fen * 0.5)))
 
     temps_centre = []
     frequence_pic = []
@@ -190,7 +257,7 @@ def FFT_glissante(x, freq, freq_min, freq_max, duree_fenetre=20.0):
 
     i = 0
     while i + fen <= N:
-        segment = x[i:i+fen]
+        segment = x[i:i + fen]
         freqs, Pxx = puissance_spectre(segment, freq, nfft=fen, window="hann")
         f_pic, SNR_db, prom = qualite_pics(freqs, Pxx, freq_min, freq_max)
         temps_centre.append((i + fen / 2) / freq)
@@ -198,12 +265,16 @@ def FFT_glissante(x, freq, freq_min, freq_max, duree_fenetre=20.0):
         decibel_SNR.append(SNR_db)
         prominence.append(prom)
         i += hop
-    return np.array(temps_centre), np.array(frequence_pic), np.array(decibel_SNR), np.array(prominence)
+
+    return (
+        np.array(temps_centre),
+        np.array(frequence_pic),
+        np.array(decibel_SNR),
+        np.array(prominence)
+    )
 
 
-def tracking_freq(freq_est, snr_db, prom_norm,saut_max=0.15, alph=0.3, snr_min=3.0, prom_min=0.02):
-
-
+def tracking_freq(freq_est, snr_db, prom_norm, saut_max=0.15, alph=0.3, snr_min=3.0, prom_min=0.02):
     f_est = np.asarray(freq_est, dtype=np.float64)
     snr_db = np.asarray(snr_db, dtype=np.float64)
     prom_norm = np.asarray(prom_norm, dtype=np.float64)
@@ -216,36 +287,39 @@ def tracking_freq(freq_est, snr_db, prom_norm,saut_max=0.15, alph=0.3, snr_min=3
         ok = np.isfinite(f) and snr_db[k] >= snr_min and prom_norm[k] >= prom_min
         if not ok:
             continue
+
         if np.isfinite(f_prev):
             if abs(f - f_prev) > saut_max:
                 continue
             f_lisse = (1 - alph) * f_prev + alph * f
         else:
             f_lisse = f
+
         f_track[k] = f_lisse
         f_prev = f_lisse
+
     return f_track
 
 
 def estimation_rr(signal_rr, fs, duree_fenetre=20.0):
-    overlap = 0.5
-    t,f,snr,prom = FFT_glissante(signal_rr, fs, freq_min=0.10, freq_max=0.50, duree_fenetre=duree_fenetre)
-    f_tr = tracking_freq(f, snr, prom,saut_max=0.05, alph=0.25)
+    t, f, snr, prom = FFT_glissante(signal_rr, fs, freq_min=0.10, freq_max=0.50, duree_fenetre=duree_fenetre)
+    f_tr = tracking_freq(f, snr, prom, saut_max=0.05, alph=0.25)
     rpm = f_tr * 60.0
-    return t, rpm, snr, prom
+    return t, rpm, snr, prom, f_tr
 
-def estimation_hr(signal_hr,fs, duree_fenetre=15.0):
-    t,f,snr,prom = FFT_glissante(signal_hr, fs, freq_min=0.8, freq_max=2.50, duree_fenetre=duree_fenetre)
-    f_tr = tracking_freq(f, snr, prom, saut_max=0.2, alph=0.3)
 
+def estimation_hr(signal_hr, fs, duree_fenetre=15.0):
+    # Bande cohérente avec le filtrage HR
+    t, f, snr, prom = FFT_glissante(signal_hr, fs, freq_min=0.80, freq_max=2.00, duree_fenetre=duree_fenetre)
+    f_tr = tracking_freq(f, snr, prom, saut_max=0.15, alph=0.25)
     bpm = f_tr * 60.0
-    
-    print(f"f HR détectée: {f_tr[~np.isnan(f_tr)][-1] if np.any(~np.isnan(f_tr)) else np.nan}")
-    return t, bpm, snr, prom
+    return t, bpm, snr, prom, f_tr
 
 
-#Boucle infinie d'execution du radar
-plt.ion()  
+# ============================================================
+# 6) Affichage constellation
+# ============================================================
+plt.ion()
 
 fig, ax = plt.subplots()
 sc = ax.scatter([], [], s=6)
@@ -255,25 +329,46 @@ ax.set_ylabel("Q")
 ax.set_title("Constellation I/Q")
 ax.grid(True)
 ax.set_aspect('equal', adjustable='box')
-
 ax.set_xlim(-1, 1)
 ax.set_ylim(-1, 1)
 
 histo_i = deque(maxlen=4000)
 histo_q = deque(maxlen=4000)
 
+
+# ============================================================
+# 7) Buffers et paramètres
+# ============================================================
 seconde_fenetre = 30.0
 echantillon_min = 200
 affichage = 1.0
-
 
 buffer_temps = deque()
 buffer_phi = deque()
 
 marqueur_print = time.time()
-
 fs_est = None
 beta_fs = 0.05
+
+idx_lock = None
+lock_margin = 2
+reacq_period = 40
+reacq_count = 0
+
+
+def choisir_idx_stable(z_bin, idx_precedent, margin=2):
+    amp = np.abs(z_bin)
+
+    if idx_precedent is None:
+        return int(np.argmax(amp))
+
+    n = len(amp)
+    left = max(0, idx_precedent - margin)
+    right = min(n, idx_precedent + margin + 1)
+
+    idx_local = left + int(np.argmax(amp[left:right]))
+    return idx_local
+
 
 try:
     while True:
@@ -281,68 +376,77 @@ try:
         if code_erreur != 0:
             closeProgram()
             break
-        
-        # -----------------------
-        # Pipeline étape 1
-        # -----------------------
-        I_brut = np.asarray(tableau_IQ[0],dtype=np.float64)
-        Q_brut = np.asarray(tableau_IQ[1],dtype=np.float64)
 
+        I_brut = np.asarray(tableau_IQ[0], dtype=np.float64)
+        Q_brut = np.asarray(tableau_IQ[1], dtype=np.float64)
         z_bin = I_brut + 1j * Q_brut
-        
-        idx = int(np.argmax(np.abs(z_bin)))
-        
-        I_moyenne = float(I_brut[idx])
-        Q_moyenne = float(Q_brut[idx])
-        I_n, Q_n = pretraitement(I_moyenne, Q_moyenne)
 
+        # -----------------------
+        # Verrouillage de cible
+        # -----------------------
+        if idx_lock is None or reacq_count >= reacq_period:
+            idx_lock = int(np.argmax(np.abs(z_bin)))
+            reacq_count = 0
+        else:
+            idx_lock = choisir_idx_stable(z_bin, idx_lock, margin=lock_margin)
 
-        #Graphe de constellation :
-        z_n = I_n + 1j * Q_n
-        
-        m = np.max(np.abs(z_n))
-        if m > 0:
-            z_n = z_n / m
-            
-        histo_i.append(z_n.real)
-        histo_q.append(z_n.imag)
-        points = np.c_[histo_i,histo_q]
+        reacq_count += 1
+
+        # moyenne locale sur quelques bins autour de l'indice verrouillé
+        left = max(0, idx_lock - 1)
+        right = min(len(z_bin), idx_lock + 2)
+        z_roi = z_bin[left:right]
+        z_sel = np.mean(z_roi)
+
+        I_sel = float(np.real(z_sel))
+        Q_sel = float(np.imag(z_sel))
+
+        # -----------------------
+        # Constellation IQ
+        # -----------------------
+        I_aff, Q_aff = pretraitement_affichage_iq(I_sel, Q_sel)
+        z_aff = I_aff + 1j * Q_aff
+
+        if abs(z_aff) > 0:
+            z_aff = z_aff / abs(z_aff)
+
+        histo_i.append(float(np.real(z_aff)))
+        histo_q.append(float(np.imag(z_aff)))
+
+        points = np.c_[histo_i, histo_q]
         sc.set_offsets(points)
-        ax.draw_artist(sc)
-        
-        fig.canvas.blit(ax.bbox)
+        fig.canvas.draw_idle()
         fig.canvas.flush_events()
-        
-        phase = np.arctan2(Q_n, I_n)
+        plt.pause(0.001)
+
+        # -----------------------
+        # Phase physiologique
+        # -----------------------
+        I_phase, Q_phase = pretraitement_phase(I_sel, Q_sel)
+        phase = np.arctan2(Q_phase, I_phase)
         phase_deplie_val = unwrap_phase(phase)
 
         t_now = time.time()
         buffer_temps.append(t_now)
         buffer_phi.append(phase_deplie_val)
 
-        # -----------------------
-        # Estimation fs lissée (EMA)
-        # -----------------------
+        # fs lissé
         if len(buffer_temps) >= 2:
             dt_last = buffer_temps[-1] - buffer_temps[-2]
             fs_inst = 1.0 / max(dt_last, 1e-6)
             fs_est = fs_inst if fs_est is None else (1 - beta_fs) * fs_est + beta_fs * fs_inst
 
-        # -----------------------
-        # Fenêtre glissante temporelle
-        # -----------------------
+        # fenêtre glissante
         while (buffer_temps[-1] - buffer_temps[0]) > seconde_fenetre:
             buffer_temps.popleft()
             buffer_phi.popleft()
-        
+
         # -----------------------
-        # Traitement si assez d’échantillons
+        # Traitement fréquentiel
         # -----------------------
         if len(buffer_phi) >= echantillon_min:
-
             tab_phi = np.array(buffer_phi, dtype=np.float64)
 
-            # On utilise fs lissé si dispo
             if fs_est is not None:
                 fs = fs_est
             else:
@@ -350,23 +454,36 @@ try:
                 dt = np.diff(tab_t)
                 fs = 1.0 / np.median(dt)
 
-            phi_passe_haut = filtre_pass_haut(tab_phi, fs)
+            # HP lent
+            phi_hp = filtre_pass_haut(tab_phi, fs, fc=0.05)
 
-            sig_rr = passe_bande(phi_passe_haut, 0.10, 0.50, fs)
-            sig_hr = passe_bande(phi_passe_haut, 1.20, 2.20, fs)
+            # RR
+            sig_rr = passe_bande(phi_hp, 0.10, 0.50, fs)
+
+            # estimation RR d'abord
+            t_rr, rr_rpm, rr_snr, rr_prom, rr_f = estimation_rr(sig_rr, fs, duree_fenetre=20.0)
+            rr_val = rr_rpm[~np.isnan(rr_rpm)]
+            rr_out = rr_val[-1] if rr_val.size else np.nan
+
+            rr_f_val = rr_f[~np.isnan(rr_f)]
+            rr_f_out = rr_f_val[-1] if rr_f_val.size else np.nan
+
+            # phase dérivée pour mieux faire ressortir la composante cardiaque
+            phi_diff = np.diff(phi_hp, prepend=phi_hp[0])
+
+            # bande HR cohérente
+            sig_hr = passe_bande(phi_diff, 0.80, 2.00, fs)
+
+            # suppression simple des harmoniques RR
+            sig_hr = notch_resp_harmonics(sig_hr, fs, rr_f_out, max_harm=6, bw=0.08)
 
             if (t_now - marqueur_print) > affichage:
-
-                t_rr, rr_rpm, rr_snr, rr_prom = estimation_rr(sig_rr, fs, duree_fenetre=20.0)
-                rr_val = rr_rpm[~np.isnan(rr_rpm)]
-                rr_out = rr_val[-1] if rr_val.size else np.nan
-
-                t_hr, hr_bpm, hr_snr, hr_prom = estimation_hr(sig_hr, fs, duree_fenetre=15.0)
+                t_hr, hr_bpm, hr_snr, hr_prom, hr_f = estimation_hr(sig_hr, fs, duree_fenetre=15.0)
                 hr_val = hr_bpm[~np.isnan(hr_bpm)]
                 hr_out = hr_val[-1] if hr_val.size else np.nan
 
-                print(f"RR: {rr_out:.2f} rpm, HR: {hr_out:.2f} bpm")
-                
+                print(f"idx={idx_lock:3d} | RR: {rr_out:.2f} rpm | HR: {hr_out:.2f} bpm | fs: {fs:.2f} Hz")
+
                 marqueur_print = t_now
 
 except KeyboardInterrupt:
