@@ -13,7 +13,7 @@ mode = 1
 f0 = 125
 BW = 240
 Ns = 200
-Ntar = 1 # 1 à 5
+Ntar = 3 # 1 à 5
 Rmax = 100
 MTI = 0
 Mth = 0
@@ -245,10 +245,10 @@ def estimation_hr(signal_hr,fs, duree_fenetre=15.0):
 
 
 #Boucle infinie d'execution du radar
-plt.ion()  # mode interactif
+plt.ion()  
 
 fig, ax = plt.subplots()
-scatter = ax.scatter([], [], s=8)
+sc = ax.scatter([], [], s=6)
 
 ax.set_xlabel("I")
 ax.set_ylabel("Q")
@@ -256,11 +256,11 @@ ax.set_title("Constellation I/Q")
 ax.grid(True)
 ax.set_aspect('equal', adjustable='box')
 
-# bornes fixes (important pour éviter le rescale permanent)
-ax.set_xlim(-2000, 2000)
-ax.set_ylim(-2000, 2000)
+ax.set_xlim(-1, 1)
+ax.set_ylim(-1, 1)
 
-
+histo_i = deque(maxlen=4000)
+histo_q = deque(maxlen=4000)
 
 seconde_fenetre = 30.0
 echantillon_min = 200
@@ -298,16 +298,21 @@ try:
 
 
         #Graphe de constellation :
-        x = np.array(I_n) + 1j*np.array(Q_n)
-        x = x - np.mean(x)  # suppression offset DC
-
-        # mise à jour des points
-        plt.scatter.set_offsets(np.c_[np.real(x), np.imag(x)])
-
-        plt.fig.canvas.draw()
-        plt.fig.canvas.flush_events()
-        plt.pause(0.001)  # très court, ne bloque pas
-
+        z_n = I_n + 1j * Q_n
+        
+        m = np.max(np.abs(z_n))
+        if m > 0:
+            z_n = z_n / m
+            
+        histo_i.append(z_n.real)
+        histo_q.append(z_n.imag)
+        points = np.c_[histo_i,histo_q]
+        sc.set_offsets(points)
+        ax.draw_artist(sc)
+        
+        fig.canvas.blit(ax.bbox)
+        fig.canvas.flush_events()
+        
         phase = np.arctan2(Q_n, I_n)
         phase_deplie_val = unwrap_phase(phase)
 
