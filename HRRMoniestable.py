@@ -24,27 +24,6 @@ Q_true = True
 movement_true = False
 
 
-# -------------------------
-# Paramètres de stabilisation
-# -------------------------
-HR_MIN_HZ = 0.90          # 54 bpm
-HR_MAX_HZ = 2.00          # 120 bpm
-HR_HALF_BAND_HZ = 0.20    # +/- 12 bpm autour de la dernière estimation stable
-HR_HARD_JUMP_HZ = 0.06    # ~3.6 bpm max entre deux estimations FFT trackées
-HR_ALPHA_TRACK = 0.12
-HR_SNR_MIN = 5.0
-HR_PROM_MIN = 0.04
-HR_MEDIAN_LEN = 7
-HR_EMA_ALPHA = 0.25
-
-RR_MIN_HZ = 0.10
-RR_MAX_HZ = 0.50
-
-TARGET_SMOOTH_ALPHA = 0.15
-TARGET_REACQ_PERIOD = 120
-TARGET_NEIGHBOR_MARGIN = 1
-
-
 def closeProgram():
     uRAD_RP_SDK11.turnOFF()
     raise SystemExit
@@ -61,6 +40,7 @@ return_code = uRAD_RP_SDK11.loadConfiguration(
 )
 if return_code != 0:
     closeProgram()
+
 
 
 # 1) Prétraitement pour affichage IQ uniquement
@@ -100,6 +80,7 @@ def pretraitement_affichage_iq(I_entree, Q_entree):
     return I_normalise, Q_normalise
 
 
+
 # 2) Prétraitement pour la PHASE seulement
 
 beta_dc_phase = 0.01
@@ -124,6 +105,7 @@ def pretraitement_phase(I_entree, Q_entree):
     Q_centre = Q_entree - moyenne_Q_phase
 
     return I_centre, Q_centre
+
 
 
 # 3) Dépliage de phase
@@ -152,6 +134,7 @@ def unwrap_phase(phase_actuelle):
     return phase_deplie
 
 
+
 # 4) Filtres
 
 def filtre_pass_haut(signal, freq_echanti, fc=0.05):
@@ -176,10 +159,9 @@ def passe_bande(signal, f_basse, f_haut, freq_echanti, ordre=4):
     return sosfiltfilt(sos, signal)
 
 
-def notch_resp_harmonics(signal, fs, f_rr, max_harm=6, bw=0.06):
+def notch_resp_harmonics(signal, fs, f_rr, max_harm=6, bw=0.08):
     """
-    Rejet fréquentiel simple des harmoniques respiratoires.
-    bw réduit pour moins attaquer la vraie composante cardiaque.
+    Rejet simple des harmoniques de respiration dans la bande HR.
     """
     x = np.asarray(signal, dtype=np.float64).copy()
 
@@ -204,6 +186,7 @@ def notch_resp_harmonics(signal, fs, f_rr, max_harm=6, bw=0.06):
             pass
 
     return x
+
 
 
 # 5) Spectre / qualité / tracking
@@ -231,8 +214,7 @@ def qualite_pics(frequence, Pxx, fmin, fmax):
     if Pxx_bande.size == 0:
         return np.nan, np.nan, 0.0
 
-    prom_min = 0.08 * np.max(Pxx_bande)
-    pics, propriete = find_peaks(Pxx_bande, prominence=prom_min)
+    pics, propriete = find_peaks(Pxx_bande, prominence=0.1 * np.max(Pxx_bande))
     bruit = np.median(Pxx_bande) + 1e-12
 
     if len(pics) == 0:
@@ -242,14 +224,13 @@ def qualite_pics(frequence, Pxx, fmin, fmax):
         SNR_db = 10.0 * np.log10(pic_pow / bruit)
         return frequence_pic, SNR_db, 0.0
 
-    idx_best = np.argmax(Pxx_bande[pics])
-    k0 = pics[idx_best]
+    k0 = pics[np.argmax(Pxx_bande[pics])]
     frequence_pic = frequence_bande[k0]
     pic_pow = Pxx_bande[k0] + 1e-12
     SNR_db = 10.0 * np.log10(pic_pow / bruit)
 
     prominences = propriete["prominences"]
-    prom = float(prominences[idx_best])
+    prom = float(prominences[np.argmax(Pxx_bande[pics])])
     prominence_norm = prom / pic_pow
 
     return frequence_pic, SNR_db, prominence_norm
@@ -273,7 +254,7 @@ def FFT_glissante(x, freq, freq_min, freq_max, duree_fenetre=20.0):
     i = 0
     while i + fen <= N:
         segment = x[i:i + fen]
-        freqs, Pxx = puissance_spectre(segment, freq, nfft=4 * fen, window="hann")
+        freqs, Pxx = puissance_spectre(segment, freq, nfft=fen, window="hann")
         f_pic, SNR_db, prom = qualite_pics(freqs, Pxx, freq_min, freq_max)
         temps_centre.append((i + fen / 2) / freq)
         frequence_pic.append(f_pic)
@@ -317,43 +298,19 @@ def tracking_freq(freq_est, snr_db, prom_norm, saut_max=0.15, alph=0.3, snr_min=
 
 
 def estimation_rr(signal_rr, fs, duree_fenetre=20.0):
-    t, f, snr, prom = FFT_glissante(signal_rr, fs, freq_min=RR_MIN_HZ, freq_max=RR_MAX_HZ, duree_fenetre=duree_fenetre)
-    f_tr = tracking_freq(f, snr, prom, saut_max=0.05, alph=0.20, snr_min=3.0, prom_min=0.02)
+    t, f, snr, prom = FFT_glissante(signal_rr, fs, freq_min=0.10, freq_max=0.50, duree_fenetre=duree_fenetre)
+    f_tr = tracking_freq(f, snr, prom, saut_max=0.05, alph=0.25)
     rpm = f_tr * 60.0
     return t, rpm, snr, prom, f_tr
 
 
-def estimation_hr(signal_hr, fs, hr_prev_hz=None, duree_fenetre=18.0):
-    fmin = HR_MIN_HZ
-    fmax = HR_MAX_HZ
-
-    if hr_prev_hz is not None and np.isfinite(hr_prev_hz):
-        fmin = max(HR_MIN_HZ, hr_prev_hz - HR_HALF_BAND_HZ)
-        fmax = min(HR_MAX_HZ, hr_prev_hz + HR_HALF_BAND_HZ)
-
-        # on évite une bande trop étroite
-        if (fmax - fmin) < 0.20:
-            centre = hr_prev_hz
-            fmin = max(HR_MIN_HZ, centre - 0.10)
-            fmax = min(HR_MAX_HZ, centre + 0.10)
-
-    t, f, snr, prom = FFT_glissante(signal_hr, fs, freq_min=fmin, freq_max=fmax, duree_fenetre=duree_fenetre)
-    f_tr = tracking_freq(
-        f, snr, prom,
-        saut_max=HR_HARD_JUMP_HZ,
-        alph=HR_ALPHA_TRACK,
-        snr_min=HR_SNR_MIN,
-        prom_min=HR_PROM_MIN
-    )
+def estimation_hr(signal_hr, fs, duree_fenetre=15.0):
+    # Bande cohérente avec le filtrage HR
+    t, f, snr, prom = FFT_glissante(signal_hr, fs, freq_min=0.80, freq_max=2.00, duree_fenetre=duree_fenetre)
+    f_tr = tracking_freq(f, snr, prom, saut_max=0.15, alph=0.25)
     bpm = f_tr * 60.0
     return t, bpm, snr, prom, f_tr
 
-
-def filtre_mediane_simple(valeurs):
-    vals = [v for v in valeurs if np.isfinite(v)]
-    if not vals:
-        return np.nan
-    return float(np.median(vals))
 
 
 # 6) Affichage constellation
@@ -375,6 +332,7 @@ histo_i = deque(maxlen=4000)
 histo_q = deque(maxlen=4000)
 
 
+
 # 7) Buffers et paramètres
 
 seconde_fenetre = 30.0
@@ -389,45 +347,23 @@ fs_est = None
 beta_fs = 0.05
 
 idx_lock = None
+lock_margin = 2
+reacq_period = 40
 reacq_count = 0
-score_bins = None
-
-hr_history = deque(maxlen=HR_MEDIAN_LEN)
-hr_last_stable_hz = np.nan
-hr_last_output = np.nan
 
 
-def init_score_bins(nbins):
-    global score_bins
-    if score_bins is None or len(score_bins) != nbins:
-        score_bins = np.zeros(nbins, dtype=np.float64)
-
-
-def choisir_idx_stable(z_bin, idx_precedent):
-    global score_bins
-
+def choisir_idx_stable(z_bin, idx_precedent, margin=2):
     amp = np.abs(z_bin)
-    init_score_bins(len(amp))
-
-    # score amorti dans le temps pour éviter de changer de bin à chaque frame
-    score_bins = (1.0 - TARGET_SMOOTH_ALPHA) * score_bins + TARGET_SMOOTH_ALPHA * amp
 
     if idx_precedent is None:
-        return int(np.argmax(score_bins))
+        return int(np.argmax(amp))
 
-    n = len(score_bins)
-    left = max(0, idx_precedent - 2)
-    right = min(n, idx_precedent + 3)
+    n = len(amp)
+    left = max(0, idx_precedent - margin)
+    right = min(n, idx_precedent + margin + 1)
 
-    idx_local = left + int(np.argmax(score_bins[left:right]))
-    local_gain = score_bins[idx_local]
-    prev_gain = score_bins[idx_precedent]
-
-    # ne change de bin que si le gain est réellement meilleur
-    if local_gain >= 1.05 * prev_gain:
-        return idx_local
-
-    return int(idx_precedent)
+    idx_local = left + int(np.argmax(amp[left:right]))
+    return idx_local
 
 
 try:
@@ -441,27 +377,27 @@ try:
         Q_brut = np.asarray(tableau_IQ[1], dtype=np.float64)
         z_bin = I_brut + 1j * Q_brut
 
-        # Verrouillage de cible plus stable
-        if idx_lock is None or reacq_count >= TARGET_REACQ_PERIOD:
-            init_score_bins(len(z_bin))
-            score_bins = np.abs(z_bin).astype(np.float64)
-            idx_lock = int(np.argmax(score_bins))
+        # Verrouillage de cible
+        if idx_lock is None or reacq_count >= reacq_period:
+            idx_lock = int(np.argmax(np.abs(z_bin)))
             reacq_count = 0
         else:
-            idx_lock = choisir_idx_stable(z_bin, idx_lock)
+            idx_lock = choisir_idx_stable(z_bin, idx_lock, margin=lock_margin)
 
         reacq_count += 1
 
         # moyenne locale sur quelques bins autour de l'indice verrouillé
-        left = max(0, idx_lock - TARGET_NEIGHBOR_MARGIN)
-        right = min(len(z_bin), idx_lock + TARGET_NEIGHBOR_MARGIN + 1)
+        left = max(0, idx_lock - 1)
+        right = min(len(z_bin), idx_lock + 2)
         z_roi = z_bin[left:right]
         z_sel = np.mean(z_roi)
 
         I_sel = float(np.real(z_sel))
         Q_sel = float(np.imag(z_sel))
 
+        
         # Constellation IQ
+        
         I_aff, Q_aff = pretraitement_affichage_iq(I_sel, Q_sel)
         z_aff = I_aff + 1j * Q_aff
 
@@ -477,7 +413,9 @@ try:
         fig.canvas.flush_events()
         plt.pause(0.001)
 
+        
         # Phase physiologique
+        
         I_phase, Q_phase = pretraitement_phase(I_sel, Q_sel)
         phase = np.arctan2(Q_phase, I_phase)
         phase_deplie_val = unwrap_phase(phase)
@@ -497,7 +435,9 @@ try:
             buffer_temps.popleft()
             buffer_phi.popleft()
 
+        
         # Traitement fréquentiel
+        
         if len(buffer_phi) >= echantillon_min:
             tab_phi = np.array(buffer_phi, dtype=np.float64)
 
@@ -512,56 +452,31 @@ try:
             phi_hp = filtre_pass_haut(tab_phi, fs, fc=0.05)
 
             # RR
-            sig_rr = passe_bande(phi_hp, RR_MIN_HZ, RR_MAX_HZ, fs)
+            sig_rr = passe_bande(phi_hp, 0.10, 0.50, fs)
+
+            # estimation RR d'abord
             t_rr, rr_rpm, rr_snr, rr_prom, rr_f = estimation_rr(sig_rr, fs, duree_fenetre=20.0)
-            rr_val = rr_rpm[np.isfinite(rr_rpm)]
+            rr_val = rr_rpm[~np.isnan(rr_rpm)]
             rr_out = rr_val[-1] if rr_val.size else np.nan
 
-            rr_f_val = rr_f[np.isfinite(rr_f)]
+            rr_f_val = rr_f[~np.isnan(rr_f)]
             rr_f_out = rr_f_val[-1] if rr_f_val.size else np.nan
 
-            # dérivée de phase pour mieux faire ressortir HR
+            # phase dérivée pour mieux faire ressortir la composante cardiaque
             phi_diff = np.diff(phi_hp, prepend=phi_hp[0])
 
-            # bande HR d'abord large, puis suppression d'harmoniques, puis estimation adaptative autour du HR stable
-            sig_hr = passe_bande(phi_diff, HR_MIN_HZ, HR_MAX_HZ, fs)
-            sig_hr = notch_resp_harmonics(sig_hr, fs, rr_f_out, max_harm=5, bw=0.06)
+            # bande HR cohérente
+            sig_hr = passe_bande(phi_diff, 0.80, 2.00, fs)
+
+            # suppression simple des harmoniques RR
+            sig_hr = notch_resp_harmonics(sig_hr, fs, rr_f_out, max_harm=6, bw=0.08)
 
             if (t_now - marqueur_print) > affichage:
-                hr_prev = hr_last_stable_hz if np.isfinite(hr_last_stable_hz) else None
-                t_hr, hr_bpm, hr_snr, hr_prom, hr_f = estimation_hr(sig_hr, fs, hr_prev_hz=hr_prev, duree_fenetre=18.0)
+                t_hr, hr_bpm, hr_snr, hr_prom, hr_f = estimation_hr(sig_hr, fs, duree_fenetre=15.0)
+                hr_val = hr_bpm[~np.isnan(hr_bpm)]
+                hr_out = hr_val[-1] if hr_val.size else np.nan
 
-                hr_val = hr_bpm[np.isfinite(hr_bpm)]
-                hr_f_val = hr_f[np.isfinite(hr_f)]
-                hr_snr_val = hr_snr[np.isfinite(hr_snr)]
-                hr_prom_val = hr_prom[np.isfinite(hr_prom)]
-
-                hr_out_raw = hr_val[-1] if hr_val.size else np.nan
-                hr_f_out = hr_f_val[-1] if hr_f_val.size else np.nan
-                hr_snr_out = hr_snr_val[-1] if hr_snr_val.size else np.nan
-                hr_prom_out = hr_prom_val[-1] if hr_prom_val.size else np.nan
-
-                # ne met à jour l'état stable que si la qualité est suffisante
-                if np.isfinite(hr_out_raw) and np.isfinite(hr_snr_out) and np.isfinite(hr_prom_out):
-                    if hr_snr_out >= HR_SNR_MIN and hr_prom_out >= HR_PROM_MIN:
-                        hr_history.append(hr_out_raw)
-                        hr_med = filtre_mediane_simple(hr_history)
-
-                        if np.isfinite(hr_med):
-                            if np.isfinite(hr_last_output):
-                                hr_last_output = (1.0 - HR_EMA_ALPHA) * hr_last_output + HR_EMA_ALPHA * hr_med
-                            else:
-                                hr_last_output = hr_med
-
-                            hr_last_stable_hz = hr_last_output / 60.0
-
-                hr_print = hr_last_output if np.isfinite(hr_last_output) else np.nan
-
-                print(
-                    f"RR: {rr_out:.2f} rpm | "
-                    f"HR: {hr_print:.2f} bpm | "
-                    f"HR_brut: {hr_out_raw:.2f} bpm | "
-                )
+                print(f"RR: {rr_out:.2f} rpm HR: {hr_out:.2f} bpm")
 
                 marqueur_print = t_now
 
