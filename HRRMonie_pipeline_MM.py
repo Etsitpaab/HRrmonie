@@ -7,8 +7,9 @@ from collections import deque
 
 
 # ============================================================
-# Configuration radar uRAD
+# Configuration radar
 # ============================================================
+
 mode = 1
 f0 = 125
 BW = 240
@@ -41,13 +42,15 @@ return_code = uRAD_RP_SDK11.loadConfiguration(
     distance_true, velocity_true, SNR_true,
     I_true, Q_true, movement_true
 )
+
 if return_code != 0:
     closeProgram()
 
 
 # ============================================================
-# 1) Prétraitement IQ
+# Prétraitement IQ
 # ============================================================
+
 beta_dc_iq = 0.001
 beta_var_iq = 0.001
 eps = 1e-6
@@ -58,486 +61,348 @@ var_I_iq = None
 var_Q_iq = None
 
 
-def pretraitement_affichage_iq(I_in, Q_in):
+def pretraitement_affichage_iq(I, Q):
+
     global mean_I_iq, mean_Q_iq, var_I_iq, var_Q_iq
 
-    I_in = float(I_in)
-    Q_in = float(Q_in)
-
     if mean_I_iq is None:
-        mean_I_iq = I_in
-        mean_Q_iq = Q_in
-        var_I_iq = 1.0
-        var_Q_iq = 1.0
+        mean_I_iq = I
+        mean_Q_iq = Q
+        var_I_iq = 1
+        var_Q_iq = 1
 
-    mean_I_iq = (1 - beta_dc_iq) * mean_I_iq + beta_dc_iq * I_in
-    mean_Q_iq = (1 - beta_dc_iq) * mean_Q_iq + beta_dc_iq * Q_in
+    mean_I_iq = (1-beta_dc_iq)*mean_I_iq + beta_dc_iq*I
+    mean_Q_iq = (1-beta_dc_iq)*mean_Q_iq + beta_dc_iq*Q
 
-    I_c = I_in - mean_I_iq
-    Q_c = Q_in - mean_Q_iq
+    Ic = I - mean_I_iq
+    Qc = Q - mean_Q_iq
 
-    var_I_iq = (1 - beta_var_iq) * var_I_iq + beta_var_iq * (I_c ** 2)
-    var_Q_iq = (1 - beta_var_iq) * var_Q_iq + beta_var_iq * (Q_c ** 2)
+    var_I_iq = (1-beta_var_iq)*var_I_iq + beta_var_iq*(Ic**2)
+    var_Q_iq = (1-beta_var_iq)*var_Q_iq + beta_var_iq*(Qc**2)
 
-    I_n = I_c / np.sqrt(var_I_iq + eps)
-    Q_n = Q_c / np.sqrt(var_Q_iq + eps)
+    In = Ic/np.sqrt(var_I_iq+eps)
+    Qn = Qc/np.sqrt(var_Q_iq+eps)
 
-    return I_n, Q_n
+    return In, Qn
 
 
 # ============================================================
-# 2) Prétraitement pour phase
+# Prétraitement phase
 # ============================================================
+
 beta_dc_phase = 0.01
 mean_I_phase = None
 mean_Q_phase = None
 
 
-def pretraitement_phase(I_in, Q_in):
+def pretraitement_phase(I,Q):
+
     global mean_I_phase, mean_Q_phase
 
-    I_in = float(I_in)
-    Q_in = float(Q_in)
-
     if mean_I_phase is None:
-        mean_I_phase = I_in
-        mean_Q_phase = Q_in
+        mean_I_phase = I
+        mean_Q_phase = Q
 
-    mean_I_phase = (1 - beta_dc_phase) * mean_I_phase + beta_dc_phase * I_in
-    mean_Q_phase = (1 - beta_dc_phase) * mean_Q_phase + beta_dc_phase * Q_in
+    mean_I_phase = (1-beta_dc_phase)*mean_I_phase + beta_dc_phase*I
+    mean_Q_phase = (1-beta_dc_phase)*mean_Q_phase + beta_dc_phase*Q
 
-    I_c = I_in - mean_I_phase
-    Q_c = Q_in - mean_Q_phase
-
-    return I_c, Q_c
+    return I-mean_I_phase , Q-mean_Q_phase
 
 
 # ============================================================
-# 3) Filtres
+# Filtres
 # ============================================================
-def filtre_pass_haut(signal, fs, fc=0.05, ordre=4):
-    x = np.asarray(signal, dtype=np.float64)
-    nyq = fs / 2.0
-    if fc <= 0 or fc >= nyq:
-        return x.copy()
-    sos = butter(ordre, fc / nyq, btype='highpass', output='sos')
-    return sosfiltfilt(sos, x)
+
+def filtre_pass_haut(signal,fs,fc=0.05,ordre=4):
+
+    nyq = fs/2
+    sos = butter(ordre,fc/nyq,btype='highpass',output='sos')
+    return sosfiltfilt(sos,signal)
 
 
-def passe_bande(signal, f_low, f_high, fs, ordre=4):
-    x = np.asarray(signal, dtype=np.float64)
-    nyq = fs / 2.0
-    if f_low <= 0 or f_high >= nyq or f_low >= f_high:
-        raise ValueError("Bornes de bande invalides.")
-    sos = butter(ordre, [f_low / nyq, f_high / nyq], btype='bandpass', output='sos')
-    return sosfiltfilt(sos, x)
+def passe_bande(signal,f_low,f_high,fs,ordre=4):
+
+    nyq = fs/2
+    sos = butter(ordre,[f_low/nyq,f_high/nyq],btype='bandpass',output='sos')
+    return sosfiltfilt(sos,signal)
 
 
 # ============================================================
-# 4) Estimation fréquentielle FFT
+# FFT
 # ============================================================
-def spectre_fft(x, fs, nfft=None, window="hann"):
-    x = np.asarray(x, dtype=np.float64)
-    N = len(x)
 
-    if N < 8:
-        return np.array([]), np.array([])
+def spectre_fft(x,fs):
 
-    if nfft is None:
-        nfft = int(2 ** np.ceil(np.log2(N)))
+    N=len(x)
+    nfft=int(2**np.ceil(np.log2(N)))
 
-    w = get_window(window, N)
-    xw = (x - np.mean(x)) * w
-    X = np.fft.rfft(xw, n=nfft)
-    P = np.abs(X) ** 2
-    f = np.fft.rfftfreq(nfft, d=1.0 / fs)
-    return f, P
+    w=get_window("hann",N)
+    xw=(x-np.mean(x))*w
+
+    X=np.fft.rfft(xw,nfft)
+
+    P=np.abs(X)**2
+    f=np.fft.rfftfreq(nfft,1/fs)
+
+    return f,P
 
 
-def extraire_pics_spectraux(signal, fs, fmin, fmax, max_peaks=8):
-    f, P = spectre_fft(signal, fs)
+# ============================================================
+# Extraction pics spectraux
+# ============================================================
 
-    if f.size == 0:
-        return []
+def extraire_pics(signal,fs,fmin,fmax):
 
-    mask = (f >= fmin) & (f <= fmax)
-    f_band = f[mask]
-    P_band = P[mask]
+    f,P = spectre_fft(signal,fs)
 
-    if len(P_band) < 3:
-        return []
+    mask=(f>=fmin)&(f<=fmax)
 
-    bruit = np.median(P_band) + 1e-12
+    f_band=f[mask]
+    P_band=P[mask]
 
-    peaks, _ = find_peaks(P_band)
-    if len(peaks) == 0:
-        peaks = np.array([int(np.argmax(P_band))])
+    peaks,_=find_peaks(P_band)
 
-    peaks_sorted = peaks[np.argsort(P_band[peaks])[::-1]]
+    if len(peaks)==0:
+        peaks=[np.argmax(P_band)]
 
-    candidats = []
-    for k in peaks_sorted[:max_peaks]:
-        freq = float(f_band[k])
-        power = float(P_band[k])
-        snr = float(10.0 * np.log10((power + 1e-12) / bruit))
+    candidats=[]
+
+    bruit=np.median(P_band)+1e-12
+
+    for k in peaks:
+
+        freq=f_band[k]
+        power=P_band[k]
+        snr=10*np.log10(power/bruit)
+
         candidats.append({
-            "freq": freq,
-            "power": power,
-            "snr": snr
+            "freq":freq,
+            "power":power,
+            "snr":snr
         })
+
+    candidats=sorted(candidats,key=lambda x:x["power"],reverse=True)
 
     return candidats
 
 
-def analyse_spectrale_debug(signal, fs, fmin, fmax):
-    candidats = extraire_pics_spectraux(signal, fs, fmin, fmax, max_peaks=8)
-
-    if len(candidats) == 0:
-        return np.nan, np.nan, np.nan, np.nan, []
-
-    f1 = candidats[0]["freq"]
-    p1 = candidats[0]["power"]
-    snr1 = candidats[0]["snr"]
-    f2 = candidats[1]["freq"] if len(candidats) > 1 else np.nan
-
-    return f1, f2, snr1, p1, candidats
-
-
 # ============================================================
-# 5) Choix HR robuste
+# Choix HR dynamique
 # ============================================================
-def est_proche_harmonique(freq, rr_hz, n_harm=5, tol=0.06):
-    if not np.isfinite(freq) or not np.isfinite(rr_hz) or rr_hz <= 0:
-        return False, None
 
-    for n in range(2, n_harm + 1):
-        fh = n * rr_hz
-        if abs(freq - fh) < tol:
-            return True, n
-    return False, None
+def choisir_hr_dynamique(candidats,rr,historique):
 
+    if len(candidats)==0:
+        return np.nan
 
-def choisir_hr_robuste(candidats_hr, rr_hz, hr_prev_hz,
-                       snr_min=3.0,
-                       tol_harm=0.06,
-                       n_harm=5,
-                       delta_f=0.35):
-    """
-    Stratégie :
-    1. supprimer les candidats trop faibles
-    2. supprimer les candidats proches des harmoniques RR
-    3. si HR précédent existe, garder les candidats cohérents temporellement
-    4. choisir le meilleur restant
-    """
+    pmax=max(c["power"] for c in candidats)
 
-    debug = {
-        "candidats_init": [],
-        "candidats_valides": [],
-        "candidats_temporels": [],
-        "raison": "aucun_candidat",
-        "harm_rejetee": []
-    }
+    prev=historique[-1] if len(historique)>0 else np.nan
+    med=np.median(historique) if len(historique)>0 else np.nan
 
-    if len(candidats_hr) == 0:
-        return np.nan, debug
+    best_freq=np.nan
+    best_score=-1
 
-    debug["candidats_init"] = [c["freq"] for c in candidats_hr]
+    for c in candidats:
 
-    # 1) Seuil SNR
-    candidats_snr = [c for c in candidats_hr if c["snr"] >= snr_min]
-    if len(candidats_snr) == 0:
-        debug["raison"] = "snr_trop_faible"
-        return np.nan, debug
+        f=c["freq"]
+        p=c["power"]
 
-    # 2) Rejet harmoniques RR
-    candidats_valides = []
-    for c in candidats_snr:
-        rejet, n_h = est_proche_harmonique(c["freq"], rr_hz, n_harm=n_harm, tol=tol_harm)
-        if rejet:
-            debug["harm_rejetee"].append((c["freq"], n_h))
+        score_p=p/pmax
+
+        if np.isfinite(rr):
+
+            d=min(abs(f-n*rr) for n in range(2,6))
+            score_h=min(1,d/0.08)
+
         else:
-            candidats_valides.append(c)
+            score_h=1
 
-    debug["candidats_valides"] = [c["freq"] for c in candidats_valides]
+        if np.isfinite(prev):
+            score_t=np.exp(-(f-prev)**2/(2*0.2**2))
+        else:
+            score_t=1
 
-    if len(candidats_valides) == 0:
-        debug["raison"] = "rejete_harmoniques_rr"
-        return np.nan, debug
+        if np.isfinite(med):
+            score_s=np.exp(-(f-med)**2/(2*0.25**2))
+        else:
+            score_s=1
 
-    # 3) Cohérence temporelle
-    if np.isfinite(hr_prev_hz):
-        candidats_temporels = [
-            c for c in candidats_valides if abs(c["freq"] - hr_prev_hz) <= delta_f
-        ]
-    else:
-        candidats_temporels = []
+        score = (
+            0.35*score_p +
+            0.25*score_h +
+            0.25*score_t +
+            0.15*score_s
+        )
 
-    debug["candidats_temporels"] = [c["freq"] for c in candidats_temporels]
+        if score>best_score:
+            best_score=score
+            best_freq=f
 
-    # 4) Choix final
-    if len(candidats_temporels) > 0:
-        # parmi ceux cohérents, on prend le plus puissant
-        best = max(candidats_temporels, key=lambda c: c["power"])
-        debug["raison"] = "choix_coherent_temporel"
-        return best["freq"], debug
+    if best_score<0.35:
+        return np.nan
 
-    # sinon parmi les valides, prendre le plus proche du HR précédent si connu
-    if np.isfinite(hr_prev_hz):
-        best = min(candidats_valides, key=lambda c: abs(c["freq"] - hr_prev_hz))
-        debug["raison"] = "repli_plus_proche_hr_precedent"
-        return best["freq"], debug
-
-    # sinon au tout début, on prend le plus puissant des valides
-    best = max(candidats_valides, key=lambda c: c["power"])
-    debug["raison"] = "initial_plus_puissant_valide"
-    return best["freq"], debug
+    return best_freq
 
 
 # ============================================================
-# 6) Affichage constellation
+# Affichage constellation
 # ============================================================
+
 plt.ion()
+fig,ax=plt.subplots()
+sc=ax.scatter([],[],s=6)
 
-fig, ax = plt.subplots()
-sc = ax.scatter([], [], s=6)
+ax.set_xlim(-1,1)
+ax.set_ylim(-1,1)
 
-ax.set_xlabel("I")
-ax.set_ylabel("Q")
-ax.set_title("Constellation I/Q")
-ax.grid(True)
-ax.set_aspect('equal', adjustable='box')
-ax.set_xlim(-1, 1)
-ax.set_ylim(-1, 1)
-
-histo_i = deque(maxlen=4000)
-histo_q = deque(maxlen=4000)
+histo_i=deque(maxlen=4000)
+histo_q=deque(maxlen=4000)
 
 
 # ============================================================
-# 7) Buffers / paramètres
+# Buffers
 # ============================================================
-fenetre_signal = 30.0
-affichage = 1.0
-echantillons_min = 200
 
-buffer_t = deque()
-buffer_phi = deque()
+buffer_t=deque()
+buffer_phi=deque()
 
-last_print = time.time()
-fs_est = None
-beta_fs = 0.05
+historique_hr=deque(maxlen=8)
 
-# lock bin
-idx_lock = None
-lock_margin = 2
-reacq_period = 40
-reacq_count = 0
+fs_est=None
+beta_fs=0.05
 
-# tracking HR
-hr_prev_hz = np.nan
-hr_last_valid_hz = np.nan
-hr_last_valid_time = None
-hold_max_s = 4.0
+last_print=time.time()
+
+fenetre_signal=30
+echantillons_min=200
 
 
 # ============================================================
-# 8) Sélection bin stable
+# Lock range bin
 # ============================================================
-def choisir_idx_stable(z_bin, idx_precedent, margin=2):
-    amp = np.abs(z_bin)
 
-    if idx_precedent is None:
-        return int(np.argmax(amp))
-
-    n = len(amp)
-    left = max(0, idx_precedent - margin)
-    right = min(n, idx_precedent + margin + 1)
-
-    idx_local = left + int(np.argmax(amp[left:right]))
-    return idx_local
+idx_lock=None
 
 
-def selection_bin_verrouillee(z_bin):
-    global idx_lock, reacq_count
+def selection_bin(z_bin):
 
-    if idx_lock is None or reacq_count >= reacq_period:
-        idx_lock = int(np.argmax(np.abs(z_bin)))
-        reacq_count = 0
-    else:
-        idx_lock = choisir_idx_stable(z_bin, idx_lock, margin=lock_margin)
+    global idx_lock
 
-    reacq_count += 1
+    amp=np.abs(z_bin)
 
-    left = max(0, idx_lock - 1)
-    right = min(len(z_bin), idx_lock + 2)
-    z_sel = np.mean(z_bin[left:right])
+    if idx_lock is None:
+        idx_lock=np.argmax(amp)
 
-    return z_sel, idx_lock
+    left=max(0,idx_lock-2)
+    right=min(len(z_bin),idx_lock+3)
+
+    idx_lock=left+np.argmax(amp[left:right])
+
+    z=np.mean(z_bin[max(0,idx_lock-1):idx_lock+2])
+
+    return z,idx_lock
 
 
 # ============================================================
-# 9) Boucle principale
+# Boucle principale
 # ============================================================
+
 try:
+
     while True:
-        code_erreur, resultat, tableau_IQ = uRAD_RP_SDK11.detection()
-        if code_erreur != 0:
+
+        err,res,IQ=uRAD_RP_SDK11.detection()
+
+        if err!=0:
             closeProgram()
 
-        I_brut = np.asarray(tableau_IQ[0], dtype=np.float64)
-        Q_brut = np.asarray(tableau_IQ[1], dtype=np.float64)
-        z_bin = I_brut + 1j * Q_brut
+        I=np.array(IQ[0],dtype=float)
+        Q=np.array(IQ[1],dtype=float)
 
-        # ----------------------------------------------------
-        # Sélection bin verrouillée
-        # ----------------------------------------------------
-        z_sel, idx_sel = selection_bin_verrouillee(z_bin)
-        I_sel = float(np.real(z_sel))
-        Q_sel = float(np.imag(z_sel))
+        z_bin=I+1j*Q
 
-        # ----------------------------------------------------
-        # Constellation
-        # ----------------------------------------------------
-        I_aff, Q_aff = pretraitement_affichage_iq(I_sel, Q_sel)
-        z_aff = I_aff + 1j * Q_aff
+        z_sel,idx=selection_bin(z_bin)
 
-        if np.abs(z_aff) > 0:
-            z_aff = z_aff / np.abs(z_aff)
+        I_sel=np.real(z_sel)
+        Q_sel=np.imag(z_sel)
 
-        histo_i.append(float(np.real(z_aff)))
-        histo_q.append(float(np.imag(z_aff)))
+        # constellation
 
-        points = np.c_[histo_i, histo_q]
-        sc.set_offsets(points)
-        fig.canvas.draw_idle()
-        fig.canvas.flush_events()
+        I_aff,Q_aff=pretraitement_affichage_iq(I_sel,Q_sel)
+
+        z_aff=I_aff+1j*Q_aff
+
+        if abs(z_aff)>0:
+            z_aff/=abs(z_aff)
+
+        histo_i.append(np.real(z_aff))
+        histo_q.append(np.imag(z_aff))
+
+        sc.set_offsets(np.c_[histo_i,histo_q])
+
         plt.pause(0.001)
 
-        # ----------------------------------------------------
-        # Pipeline phase
-        # ----------------------------------------------------
-        I_c, Q_c = pretraitement_phase(I_sel, Q_sel)
-        phase = np.arctan2(Q_c, I_c)
+        # phase
 
-        t_now = time.time()
-        buffer_t.append(t_now)
+        I_c,Q_c=pretraitement_phase(I_sel,Q_sel)
+
+        phase=np.arctan2(Q_c,I_c)
+
+        t=time.time()
+
+        buffer_t.append(t)
         buffer_phi.append(phase)
 
-        # estimation fs
-        if len(buffer_t) >= 2:
-            dt = buffer_t[-1] - buffer_t[-2]
-            fs_inst = 1.0 / max(dt, 1e-6)
-            if fs_est is None:
-                fs_est = fs_inst
-            else:
-                fs_est = (1 - beta_fs) * fs_est + beta_fs * fs_inst
+        if len(buffer_t)>=2:
 
-        # fenêtre glissante
-        while len(buffer_t) > 1 and (buffer_t[-1] - buffer_t[0]) > fenetre_signal:
+            dt=buffer_t[-1]-buffer_t[-2]
+            fs_inst=1/max(dt,1e-6)
+
+            if fs_est is None:
+                fs_est=fs_inst
+            else:
+                fs_est=(1-beta_fs)*fs_est+beta_fs*fs_inst
+
+        while buffer_t[-1]-buffer_t[0]>fenetre_signal:
+
             buffer_t.popleft()
             buffer_phi.popleft()
 
-        # ----------------------------------------------------
-        # Traitement fréquentiel
-        # ----------------------------------------------------
-        if len(buffer_phi) >= echantillons_min and fs_est is not None:
-            phi_wrap = np.array(buffer_phi, dtype=np.float64)
-            phi = np.unwrap(phi_wrap)
+        if len(buffer_phi)>=echantillons_min and fs_est is not None:
 
-            # suppression dérive lente / composante DC
-            phi_hp = filtre_pass_haut(phi, fs_est, fc=0.05)
+            phi=np.unwrap(np.array(buffer_phi))
 
-            # bandes physiologiques
-            sig_rr = passe_bande(phi_hp, 0.10, 0.50, fs_est)
-            sig_hr = passe_bande(phi_hp, 0.80, 2.50, fs_est)
+            phi_hp=filtre_pass_haut(phi,fs_est)
 
-            # analyse RR
-            rr_hz_dom, rr2, rr_snr, rr_pow, rr_candidats = analyse_spectrale_debug(
-                sig_rr, fs_est, 0.10, 0.50
-            )
-            rr_hz = rr_hz_dom
-            rr_rpm = rr_hz * 60.0 if np.isfinite(rr_hz) else np.nan
+            sig_rr=passe_bande(phi_hp,0.10,0.50,fs_est)
+            sig_hr=passe_bande(phi_hp,0.80,2.50,fs_est)
 
-            # analyse HR
-            hr_hz_dom, hr2, hr_snr, hr_pow, hr_candidats = analyse_spectrale_debug(
-                sig_hr, fs_est, 0.80, 2.50
-            )
+            rr_candidats=extraire_pics(sig_rr,fs_est,0.10,0.50)
 
-            hr_hz_robuste, hr_debug = choisir_hr_robuste(
-                hr_candidats,
-                rr_hz,
-                hr_prev_hz,
-                snr_min=3.0,
-                tol_harm=0.06,
-                n_harm=5,
-                delta_f=0.35
-            )
+            rr=rr_candidats[0]["freq"] if len(rr_candidats)>0 else np.nan
 
-            hr_source = "nouveau"
+            hr_candidats=extraire_pics(sig_hr,fs_est,0.80,2.50)
 
-            # stratégie de hold si rien de valide
-            if np.isfinite(hr_hz_robuste):
-                hr_prev_hz = hr_hz_robuste
-                hr_last_valid_hz = hr_hz_robuste
-                hr_last_valid_time = t_now
-                hr_final_hz = hr_hz_robuste
-            else:
-                if hr_last_valid_time is not None and (t_now - hr_last_valid_time) <= hold_max_s:
-                    hr_final_hz = hr_last_valid_hz
-                    hr_source = "hold_last_valid"
-                else:
-                    hr_final_hz = np.nan
-                    hr_source = "nan"
+            hr=choisir_hr_dynamique(hr_candidats,rr,historique_hr)
 
-            hr_bpm = hr_final_hz * 60.0 if np.isfinite(hr_final_hz) else np.nan
+            if np.isfinite(hr):
+                historique_hr.append(hr)
 
-            # ------------------------------------------------
-            # Debug
-            # ------------------------------------------------
-            if (t_now - last_print) > affichage:
-                harm2 = 2 * rr_hz if np.isfinite(rr_hz) else np.nan
-                harm3 = 3 * rr_hz if np.isfinite(rr_hz) else np.nan
-                harm4 = 4 * rr_hz if np.isfinite(rr_hz) else np.nan
-                harm5 = 5 * rr_hz if np.isfinite(rr_hz) else np.nan
+            rr_rpm=rr*60 if np.isfinite(rr) else np.nan
+            hr_bpm=hr*60 if np.isfinite(hr) else np.nan
 
-                hr_cand_str = ", ".join([f"{c['freq']:.3f}" for c in hr_candidats[:5]]) if hr_candidats else "aucun"
-                hr_valid_str = ", ".join([f"{x:.3f}" for x in hr_debug["candidats_valides"]]) if hr_debug["candidats_valides"] else "aucun"
-                hr_temp_str = ", ".join([f"{x:.3f}" for x in hr_debug["candidats_temporels"]]) if hr_debug["candidats_temporels"] else "aucun"
-
-                if len(hr_debug["harm_rejetee"]) > 0:
-                    harm_rej_str = ", ".join([f"{f0:.3f}(~{n}xRR)" for f0, n in hr_debug["harm_rejetee"]])
-                else:
-                    harm_rej_str = "aucun"
+            if time.time()-last_print>1:
 
                 print(
-                    f"\n---------------- DEBUG ----------------\n"
-                    f"bin_idx            : {idx_sel}\n"
-                    f"bin_amplitude      : {abs(z_sel):.4f}\n"
-                    f"fs_est             : {fs_est:.2f} Hz\n"
-                    f"\n"
-                    f"RR dominant        : {rr_hz:.3f} Hz  ({rr_rpm:.2f} rpm)\n"
-                    f"RR 2nd peak        : {rr2:.3f} Hz\n"
-                    f"RR SNR             : {rr_snr:.2f} dB\n"
-                    f"\n"
-                    f"HR dominant brut   : {hr_hz_dom:.3f} Hz  ({hr_hz_dom*60.0 if np.isfinite(hr_hz_dom) else np.nan:.2f} bpm)\n"
-                    f"HR 2nd peak brut   : {hr2:.3f} Hz\n"
-                    f"HR SNR brut        : {hr_snr:.2f} dB\n"
-                    f"\n"
-                    f"HR candidats       : {hr_cand_str}\n"
-                    f"HR valides         : {hr_valid_str}\n"
-                    f"HR cohérents temp. : {hr_temp_str}\n"
-                    f"HR rejetés harm.   : {harm_rej_str}\n"
-                    f"raison choix HR    : {hr_debug['raison']}\n"
-                    f"source HR sortie   : {hr_source}\n"
-                    f"\n"
-                    f"HR final           : {hr_final_hz:.3f} Hz  ({hr_bpm:.2f} bpm)\n"
-                    f"HR précédent       : {hr_prev_hz:.3f} Hz\n"
-                    f"\n"
-                    f"Resp harmonics     : {harm2:.3f}Hz {harm3:.3f}Hz {harm4:.3f}Hz {harm5:.3f}Hz\n"
-                    f"---------------------------------------"
+                    f"\nIDX {idx}"
+                    f"\nRR : {rr_rpm:.2f} rpm"
+                    f"\nHR : {hr_bpm:.2f} bpm"
+                    f"\nfs : {fs_est:.2f} Hz"
                 )
 
-                last_print = t_now
+                last_print=time.time()
 
 except KeyboardInterrupt:
+
     closeProgram()
