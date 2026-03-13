@@ -210,6 +210,33 @@ def selection_bin_simple(z_bin):
     return np.mean(z_bin[left:right]), idx
 
 # 8) Boucle principale
+def analyse_spectrale_debug(signal, fs, fmin, fmax):
+
+    f, P = spectre_fft(signal, fs)
+
+    if f.size == 0:
+        return np.nan, np.nan, np.nan, np.nan
+
+    mask = (f >= fmin) & (f <= fmax)
+    f_band = f[mask]
+    P_band = P[mask]
+
+    if len(P_band) < 3:
+        return np.nan, np.nan, np.nan, np.nan
+
+    idx_sorted = np.argsort(P_band)[::-1]
+
+    f1 = f_band[idx_sorted[0]]
+    p1 = P_band[idx_sorted[0]]
+
+    f2 = f_band[idx_sorted[1]]
+    p2 = P_band[idx_sorted[1]]
+
+    bruit = np.median(P_band) + 1e-12
+    snr = 10*np.log10(p1/bruit)
+
+    return f1, f2, snr, p1
+
 
 try:
     while True:
@@ -281,17 +308,34 @@ try:
             # bandes physiologiques de base
             sig_rr = passe_bande(phi_hp, 0.10, 0.50, fs_est)
             sig_hr = passe_bande(phi_hp, 0.80, 2.50, fs_est)
-
-            rr_hz = frequence_dominante(sig_rr, fs_est, 0.10, 0.50)
-            hr_hz = frequence_dominante(sig_hr, fs_est, 0.80, 2.50)
+            rr_hz, rr2, rr_snr, rr_pow = analyse_spectrale_debug(sig_rr, fs_est, 0.10, 0.50)
+            hr_hz, hr2, hr_snr, hr_pow = analyse_spectrale_debug(sig_hr, fs_est, 0.80, 2.50)
 
             rr_rpm = rr_hz * 60.0 if np.isfinite(rr_hz) else np.nan
             hr_bpm = hr_hz * 60.0 if np.isfinite(hr_hz) else np.nan
 
             if (t_now - last_print) > affichage:
+
                 print(
-                    f"idx={idx_sel:3d} | RR: {rr_rpm:.2f} rpm | HR: {hr_bpm:.2f} bpm | fs: {fs_est:.2f} Hz"
+                    f"\n---------------- DEBUG ----------------\n"
+                    f"bin_idx        : {idx_sel}\n"
+                    f"bin_amplitude  : {abs(z_sel):.4f}\n"
+                    f"fs_est         : {fs_est:.2f} Hz\n"
+                    f"\n"
+                    f"RR dominant    : {rr_hz:.3f} Hz  ({rr_rpm:.2f} rpm)\n"
+                    f"RR 2nd peak    : {rr2:.3f} Hz\n"
+                    f"RR SNR         : {rr_snr:.2f} dB\n"
+                    f"\n"
+                    f"HR dominant    : {hr_hz:.3f} Hz  ({hr_bpm:.2f} bpm)\n"
+                    f"HR 2nd peak    : {hr2:.3f} Hz\n"
+                    f"HR SNR         : {hr_snr:.2f} dB\n"
+                    f"\n"
+                    f"Resp harmonics : "
+                    f"{2*rr_hz:.3f}Hz {3*rr_hz:.3f}Hz {4*rr_hz:.3f}Hz\n"
+                    f"---------------------------------------"
                 )
+
+                last_print = t_now
                 last_print = t_now
 
 except KeyboardInterrupt:
