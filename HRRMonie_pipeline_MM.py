@@ -1,15 +1,13 @@
 import time
 import numpy as np
-from scipy.signal import butter, sosfiltfilt, get_window, find_peaks
+from scipy.signal import butter, sosfiltfilt, get_window
 import uRAD_RP_SDK11
 import matplotlib.pyplot as plt
 from collections import deque
 
-
 # ============================================================
-# Configuration radar
+# Configuration radar uRAD
 # ============================================================
-
 mode = 1
 f0 = 125
 BW = 240
@@ -42,15 +40,14 @@ return_code = uRAD_RP_SDK11.loadConfiguration(
     distance_true, velocity_true, SNR_true,
     I_true, Q_true, movement_true
 )
-
 if return_code != 0:
     closeProgram()
 
 
 # ============================================================
-# Prétraitement IQ
+# 1) Prétraitement IQ léger pour affichage constellation
+#    -> retrait DC + normalisation légère
 # ============================================================
-
 beta_dc_iq = 0.001
 beta_var_iq = 0.001
 eps = 1e-6
@@ -61,198 +58,133 @@ var_I_iq = None
 var_Q_iq = None
 
 
-def pretraitement_affichage_iq(I, Q):
-
+def pretraitement_affichage_iq(I_in, Q_in):
     global mean_I_iq, mean_Q_iq, var_I_iq, var_Q_iq
 
+    I_in = float(I_in)
+    Q_in = float(Q_in)
+
     if mean_I_iq is None:
-        mean_I_iq = I
-        mean_Q_iq = Q
-        var_I_iq = 1
-        var_Q_iq = 1
+        mean_I_iq = I_in
+        mean_Q_iq = Q_in
+        var_I_iq = 1.0
+        var_Q_iq = 1.0
 
-    mean_I_iq = (1 - beta_dc_iq) * mean_I_iq + beta_dc_iq * I
-    mean_Q_iq = (1 - beta_dc_iq) * mean_Q_iq + beta_dc_iq * Q
+    mean_I_iq = (1 - beta_dc_iq) * mean_I_iq + beta_dc_iq * I_in
+    mean_Q_iq = (1 - beta_dc_iq) * mean_Q_iq + beta_dc_iq * Q_in
 
-    Ic = I - mean_I_iq
-    Qc = Q - mean_Q_iq
+    I_c = I_in - mean_I_iq
+    Q_c = Q_in - mean_Q_iq
 
-    var_I_iq = (1 - beta_var_iq) * var_I_iq + beta_var_iq * (Ic ** 2)
-    var_Q_iq = (1 - beta_var_iq) * var_Q_iq + beta_var_iq * (Qc ** 2)
+    var_I_iq = (1 - beta_var_iq) * var_I_iq + beta_var_iq * (I_c ** 2)
+    var_Q_iq = (1 - beta_var_iq) * var_Q_iq + beta_var_iq * (Q_c ** 2)
 
-    In = Ic / np.sqrt(var_I_iq + eps)
-    Qn = Qc / np.sqrt(var_Q_iq + eps)
+    I_n = I_c / np.sqrt(var_I_iq + eps)
+    Q_n = Q_c / np.sqrt(var_Q_iq + eps)
 
-    return In, Qn
+    return I_n, Q_n
 
 
 # ============================================================
-# Prétraitement phase
+# 2) Prétraitement pour phase
+#    -> uniquement retrait DC sur I/Q
 # ============================================================
-
 beta_dc_phase = 0.01
 mean_I_phase = None
 mean_Q_phase = None
 
 
-def pretraitement_phase(I, Q):
-
+def pretraitement_phase(I_in, Q_in):
     global mean_I_phase, mean_Q_phase
 
+    I_in = float(I_in)
+    Q_in = float(Q_in)
+
     if mean_I_phase is None:
-        mean_I_phase = I
-        mean_Q_phase = Q
+        mean_I_phase = I_in
+        mean_Q_phase = Q_in
 
-    mean_I_phase = (1 - beta_dc_phase) * mean_I_phase + beta_dc_phase * I
-    mean_Q_phase = (1 - beta_dc_phase) * mean_Q_phase + beta_dc_phase * Q
+    mean_I_phase = (1 - beta_dc_phase) * mean_I_phase + beta_dc_phase * I_in
+    mean_Q_phase = (1 - beta_dc_phase) * mean_Q_phase + beta_dc_phase * Q_in
 
-    return I - mean_I_phase, Q - mean_Q_phase
+    I_c = I_in - mean_I_phase
+    Q_c = Q_in - mean_Q_phase
+
+    return I_c, Q_c
 
 
 # ============================================================
-# Filtres
+# 3) Filtres
 # ============================================================
-
 def filtre_pass_haut(signal, fs, fc=0.05, ordre=4):
-
-    nyq = fs / 2
+    x = np.asarray(signal, dtype=np.float64)
+    nyq = fs / 2.0
+    if fc <= 0 or fc >= nyq:
+        return x.copy()
     sos = butter(ordre, fc / nyq, btype='highpass', output='sos')
-    return sosfiltfilt(sos, signal)
+    return sosfiltfilt(sos, x)
 
 
 def passe_bande(signal, f_low, f_high, fs, ordre=4):
-
-    nyq = fs / 2
+    x = np.asarray(signal, dtype=np.float64)
+    nyq = fs / 2.0
+    if f_low <= 0 or f_high >= nyq or f_low >= f_high:
+        raise ValueError("Bornes de bande invalides.")
     sos = butter(ordre, [f_low / nyq, f_high / nyq], btype='bandpass', output='sos')
-    return sosfiltfilt(sos, signal)
+    return sosfiltfilt(sos, x)
 
 
 # ============================================================
-# FFT
+# 4) Estimation fréquentielle simple par FFT
 # ============================================================
-
-def spectre_fft(x, fs):
-
+def spectre_fft(x, fs, nfft=None, window="hann"):
+    x = np.asarray(x, dtype=np.float64)
     N = len(x)
-    nfft = int(2 ** np.ceil(np.log2(N)))
 
-    w = get_window("hann", N)
+    if N < 8:
+        return np.array([]), np.array([])
+
+    if nfft is None:
+        nfft = int(2 ** np.ceil(np.log2(N)))
+
+    w = get_window(window, N)
     xw = (x - np.mean(x)) * w
-
-    X = np.fft.rfft(xw, nfft)
-
+    X = np.fft.rfft(xw, n=nfft)
     P = np.abs(X) ** 2
-    f = np.fft.rfftfreq(nfft, 1 / fs)
-
+    f = np.fft.rfftfreq(nfft, d=1.0 / fs)
     return f, P
 
 
-# ============================================================
-# Extraction pics spectraux
-# ============================================================
+def frequence_dominante(x, fs, fmin, fmax):
+    f, P = spectre_fft(x, fs)
 
-def extraire_pics(signal, fs, fmin, fmax):
-
-    f, P = spectre_fft(signal, fs)
+    if f.size == 0:
+        return np.nan
 
     mask = (f >= fmin) & (f <= fmax)
+    if not np.any(mask):
+        return np.nan
 
     f_band = f[mask]
     P_band = P[mask]
 
-    peaks, _ = find_peaks(P_band)
-
-    if len(peaks) == 0:
-        peaks = [np.argmax(P_band)]
-
-    candidats = []
-
-    bruit = np.median(P_band) + 1e-12
-
-    for k in peaks:
-
-        freq = f_band[k]
-        power = P_band[k]
-        snr = 10 * np.log10(power / bruit)
-
-        candidats.append({
-            "freq": freq,
-            "power": power,
-            "snr": snr
-        })
-
-    candidats = sorted(candidats, key=lambda x: x["power"], reverse=True)
-
-    return candidats
+    idx = int(np.argmax(P_band))
+    return float(f_band[idx])
 
 
 # ============================================================
-# Choix HR dynamique
+# 5) Affichage constellation
 # ============================================================
-
-def choisir_hr_dynamique(candidats, rr, historique):
-
-    if len(candidats) == 0:
-        return np.nan
-
-    pmax = max(c["power"] for c in candidats)
-
-    prev = historique[-1] if len(historique) > 0 else np.nan
-    med = np.median(historique) if len(historique) > 0 else np.nan
-
-    best_freq = np.nan
-    best_score = -1
-
-    for c in candidats:
-
-        f = c["freq"]
-        p = c["power"]
-
-        score_p = p / pmax
-
-        if np.isfinite(rr):
-            d = min(abs(f - n * rr) for n in range(2, 6))
-            score_h = max(0, 1 - d / 0.08)
-            # Variante possible plus douce :
-            # score_h = np.exp(-(d**2) / (2 * 0.08**2))
-        else:
-            score_h = 1
-
-        if np.isfinite(prev):
-            score_t = np.exp(-(f - prev) ** 2 / (2 * 0.2 ** 2))
-        else:
-            score_t = 1
-
-        if np.isfinite(med):
-            score_s = np.exp(-(f - med) ** 2 / (2 * 0.25 ** 2))
-        else:
-            score_s = 1
-
-        score = (
-            0.35 * score_p +
-            0.25 * score_h +
-            0.25 * score_t +
-            0.15 * score_s
-        )
-
-        if score > best_score:
-            best_score = score
-            best_freq = f
-
-    if best_score < 0.35:
-        return np.nan
-
-    return best_freq
-
-
-# ============================================================
-# Affichage constellation
-# ============================================================
-
 plt.ion()
+
 fig, ax = plt.subplots()
 sc = ax.scatter([], [], s=6)
 
+ax.set_xlabel("I")
+ax.set_ylabel("Q")
+ax.set_title("Constellation I/Q")
+ax.grid(True)
+ax.set_aspect('equal', adjustable='box')
 ax.set_xlim(-1, 1)
 ax.set_ylim(-1, 1)
 
@@ -261,144 +193,118 @@ histo_q = deque(maxlen=4000)
 
 
 # ============================================================
-# Buffers
+# 6) Buffers / paramètres
 # ============================================================
+fenetre_signal = 30.0
+affichage = 1.0
+echantillons_min = 200
 
 buffer_t = deque()
 buffer_phi = deque()
 
-historique_hr = deque(maxlen=8)
-
+last_print = time.time()
 fs_est = None
 beta_fs = 0.05
 
-last_print = time.time()
 
-fenetre_signal = 30
-echantillons_min = 200
+# ============================================================
+# 7) Sélection simple de bin
+#    -> on prend le bin le plus énergétique puis moyenne locale
+# ============================================================
+def selection_bin_simple(z_bin):
+    idx = int(np.argmax(np.abs(z_bin)))
+    left = max(0, idx - 1)
+    right = min(len(z_bin), idx + 2)
+    return np.mean(z_bin[left:right]), idx
 
 
 # ============================================================
-# Lock range bin
+# 8) Boucle principale
 # ============================================================
-
-idx_lock = None
-
-
-def selection_bin(z_bin):
-
-    global idx_lock
-
-    amp = np.abs(z_bin)
-
-    if idx_lock is None:
-        idx_lock = np.argmax(amp)
-
-    left = max(0, idx_lock - 2)
-    right = min(len(z_bin), idx_lock + 3)
-
-    idx_lock = left + np.argmax(amp[left:right])
-
-    z = np.mean(z_bin[max(0, idx_lock - 1):idx_lock + 2])
-
-    return z, idx_lock
-
-
-# ============================================================
-# Boucle principale
-# ============================================================
-
 try:
-
     while True:
-
-        err, res, IQ = uRAD_RP_SDK11.detection()
-
-        if err != 0:
+        code_erreur, resultat, tableau_IQ = uRAD_RP_SDK11.detection()
+        if code_erreur != 0:
             closeProgram()
 
-        I = np.array(IQ[0], dtype=float)
-        Q = np.array(IQ[1], dtype=float)
+        I_brut = np.asarray(tableau_IQ[0], dtype=np.float64)
+        Q_brut = np.asarray(tableau_IQ[1], dtype=np.float64)
+        z_bin = I_brut + 1j * Q_brut
 
-        z_bin = I + 1j * Q
+        # ----------------------------------------------------
+        # Sélection bin simple
+        # ----------------------------------------------------
+        z_sel, idx_sel = selection_bin_simple(z_bin)
+        I_sel = float(np.real(z_sel))
+        Q_sel = float(np.imag(z_sel))
 
-        z_sel, idx = selection_bin(z_bin)
-
-        I_sel = np.real(z_sel)
-        Q_sel = np.imag(z_sel)
-
-        # constellation
+        # ----------------------------------------------------
+        # Constellation
+        # ----------------------------------------------------
         I_aff, Q_aff = pretraitement_affichage_iq(I_sel, Q_sel)
-
         z_aff = I_aff + 1j * Q_aff
 
-        if abs(z_aff) > 0:
-            z_aff /= abs(z_aff)
+        if np.abs(z_aff) > 0:
+            z_aff = z_aff / np.abs(z_aff)
 
-        histo_i.append(np.real(z_aff))
-        histo_q.append(np.imag(z_aff))
+        histo_i.append(float(np.real(z_aff)))
+        histo_q.append(float(np.imag(z_aff)))
 
-        sc.set_offsets(np.c_[histo_i, histo_q])
-
+        points = np.c_[histo_i, histo_q]
+        sc.set_offsets(points)
+        fig.canvas.draw_idle()
+        fig.canvas.flush_events()
         plt.pause(0.001)
 
-        # phase
+        # ----------------------------------------------------
+        # Pipeline phase BASIQUE
+        # ----------------------------------------------------
         I_c, Q_c = pretraitement_phase(I_sel, Q_sel)
-
         phase = np.arctan2(Q_c, I_c)
 
-        t = time.time()
-
-        buffer_t.append(t)
+        t_now = time.time()
+        buffer_t.append(t_now)
         buffer_phi.append(phase)
 
+        # estimation fs
         if len(buffer_t) >= 2:
-
             dt = buffer_t[-1] - buffer_t[-2]
-            fs_inst = 1 / max(dt, 1e-6)
-
+            fs_inst = 1.0 / max(dt, 1e-6)
             if fs_est is None:
                 fs_est = fs_inst
             else:
                 fs_est = (1 - beta_fs) * fs_est + beta_fs * fs_inst
 
-        while buffer_t[-1] - buffer_t[0] > fenetre_signal:
-
+        # fenêtre glissante
+        while len(buffer_t) > 1 and (buffer_t[-1] - buffer_t[0]) > fenetre_signal:
             buffer_t.popleft()
             buffer_phi.popleft()
 
+        # ----------------------------------------------------
+        # Traitement fréquentiel simple
+        # ----------------------------------------------------
         if len(buffer_phi) >= echantillons_min and fs_est is not None:
+            phi_wrap = np.array(buffer_phi, dtype=np.float64)
+            phi = np.unwrap(phi_wrap)
 
-            phi = np.unwrap(np.array(buffer_phi))
+            # suppression dérive lente / composante DC
+            phi_hp = filtre_pass_haut(phi, fs_est, fc=0.05)
 
-            phi_hp = filtre_pass_haut(phi, fs_est)
-
+            # bandes physiologiques de base
             sig_rr = passe_bande(phi_hp, 0.10, 0.50, fs_est)
             sig_hr = passe_bande(phi_hp, 0.80, 2.50, fs_est)
 
-            rr_candidats = extraire_pics(sig_rr, fs_est, 0.10, 0.50)
-            rr = rr_candidats[0]["freq"] if len(rr_candidats) > 0 else np.nan
+            rr_hz = frequence_dominante(sig_rr, fs_est, 0.10, 0.50)
+            hr_hz = frequence_dominante(sig_hr, fs_est, 0.80, 2.50)
 
-            hr_candidats = extraire_pics(sig_hr, fs_est, 0.80, 2.50)
-            hr = choisir_hr_dynamique(hr_candidats, rr, historique_hr)
+            rr_rpm = rr_hz * 60.0 if np.isfinite(rr_hz) else np.nan
+            hr_bpm = hr_hz * 60.0 if np.isfinite(hr_hz) else np.nan
 
-            if np.isfinite(hr):
-                historique_hr.append(hr)
-
-            rr_rpm = rr * 60 if np.isfinite(rr) else np.nan
-            hr_bpm = hr * 60 if np.isfinite(hr) else np.nan
-
-            if time.time() - last_print > 1:
-
+            if (t_now - last_print) > affichage:
                 print(
-                    f"\nIDX {idx}"
-                    f"\nRR : {rr_rpm:.2f} rpm"
-                    f"\nHR : {hr_bpm:.2f} bpm"
-                    f"\nfs : {fs_est:.2f} Hz"
+                    f"idx={idx_sel:3d} | RR: {rr_rpm:.2f} rpm | HR: {hr_bpm:.2f} bpm | fs: {fs_est:.2f} Hz"
                 )
-
-                last_print = time.time()
+                last_print = t_now
 
 except KeyboardInterrupt:
-
     closeProgram()
