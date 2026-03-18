@@ -1,6 +1,6 @@
 import time
 import numpy as np
-from scipy.signal import butter, sosfiltfilt, get_window
+from scipy.signal import butter, sosfiltfilt, get_window, find_peaks
 import uRAD_RP_SDK11
 from collections import deque
 
@@ -92,7 +92,7 @@ def filtre_passe_bande(signal, f_low, f_high, fs, ordre=4):
 
 
 # ============================================================
-# FFT
+# FFT / pics spectraux
 # ============================================================
 def spectre_fft(x, fs, nfft=None, window="hann"):
     x = np.asarray(x, dtype=np.float64)
@@ -126,6 +126,39 @@ def frequence_dominante(signal, fs, fmin, fmax):
     P_band = P[mask]
     idx = np.argmax(P_band)
     return float(f_band[idx])
+
+
+def extraire_pics_spectraux(signal, fs, fmin, fmax, max_peaks=6):
+    f, P = spectre_fft(signal, fs)
+    if f.size == 0:
+        return []
+
+    mask = (f >= fmin) & (f <= fmax)
+    f_band = f[mask]
+    P_band = P[mask]
+
+    if len(P_band) < 3:
+        return []
+
+    bruit = np.median(P_band) + 1e-12
+    peaks, _ = find_peaks(P_band)
+
+    if len(peaks) == 0:
+        peaks = np.array([int(np.argmax(P_band))])
+
+    peaks = peaks[np.argsort(P_band[peaks])[::-1]]
+
+    candidats = []
+    for k in peaks[:max_peaks]:
+        power = float(P_band[k])
+        snr = float(10.0 * np.log10((power + 1e-12) / bruit))
+        candidats.append({
+            "freq": float(f_band[k]),
+            "power": power,
+            "snr": snr
+        })
+
+    return candidats
 
 
 # ============================================================
@@ -184,6 +217,146 @@ def selection_bin_verrouillee(z_bin):
     z_sel = np.mean(z_bin[left_avg:right_avg])
 
     return z_sel, idx_lock
+
+
+# ============================================================
+# Sélection HR robuste : init + tracking + réacquisition
+# ============================================================
+hr_prev_hz = np.nan
+hr_last_valid_hz = np.nan
+hr_last_valid_time = None
+
+hold_max_s = 4.0
+hr_delta_track = 0.18
+hr_delta_reacq = 0.45
+hr_beta = 0.25
+hr_init_confirm_needed = 3
+
+hr_init_history = deque(maxlen=5)
+
+
+def est_proche_harmonique(freq, rr_hz, n_harm=5, tol=0.06):
+    if not np.isfinite(freq) or not np.isfinite(rr_hz) or rr_hz <= 0:
+        return False, None
+
+    for n in range(2, n_harm + 1):
+        fh = n * rr_hz
+        if abs(freq - fh) < tol:
+            return True, n
+
+    return False, None
+
+
+def score_candidat_hr(c, hr_prev, rr_hz):
+    score = c["snr"]
+
+    # on valorise les candidats non collés aux harmoniques RR
+    rejet, n_h = est_proche_harmonique(c["freq"], rr_hz, n_harm=5, tol=0.06)
+    if rejet:
+        score -= 6.0
+
+    # plage physiologique centrale plus probable
+    if 0.95 <= c["freq"] <= 1.80:
+        score += 1.5
+
+    # proximité temporelle si suivi existant
+    if np.isfinite(hr_prev):
+        ecart = abs(c["freq"] - hr_prev)
+        score -= 8.0 * ecart
+
+    return score
+
+
+def lisser_hr(hr_new, hr_old, beta=0.25):
+    if not np.isfinite(hr_new):
+        return hr_old
+    if not np.isfinite(hr_old):
+        return hr_new
+    return (1 - beta) * hr_old + beta * hr_new
+
+
+def choisir_hr_robuste(candidats_hr, rr_hz, t_now):
+    global hr_prev_hz, hr_last_valid_hz, hr_last_valid_time, hr_init_history
+
+    if len(candidats_hr) == 0:
+        if hr_last_valid_time is not None and (t_now - hr_last_valid_time) <= hold_max_s:
+            return hr_last_valid_hz
+        return np.nan
+
+    # on garde uniquement des candidats avec SNR minimal
+    valides = [c for c in candidats_hr if c["snr"] >= 2.5]
+
+    # si tout est faible, on garde quand même les 2 meilleurs pour ne pas bloquer trop tôt
+    if len(valides) == 0:
+        valides = candidats_hr[:2]
+
+    # ----------------------------------------
+    # Cas 1 : on a déjà un suivi valide
+    # ----------------------------------------
+    if np.isfinite(hr_prev_hz):
+        proches = [c for c in valides if abs(c["freq"] - hr_prev_hz) <= hr_delta_track]
+
+        if len(proches) > 0:
+            best = max(proches, key=lambda c: score_candidat_hr(c, hr_prev_hz, rr_hz))
+            hr_prev_hz = lisser_hr(best["freq"], hr_prev_hz, beta=hr_beta)
+            hr_last_valid_hz = hr_prev_hz
+            hr_last_valid_time = t_now
+            return hr_prev_hz
+
+        # pas de candidat proche : tentative de réacquisition contrôlée
+        plausibles = []
+        for c in valides:
+            rejet, _ = est_proche_harmonique(c["freq"], rr_hz, n_harm=5, tol=0.06)
+            if not rejet and 0.90 <= c["freq"] <= 2.00:
+                plausibles.append(c)
+
+        if len(plausibles) > 0:
+            best = max(plausibles, key=lambda c: score_candidat_hr(c, hr_prev_hz, rr_hz))
+
+            # réacquisition seulement si pas trop loin non plus
+            if abs(best["freq"] - hr_prev_hz) <= hr_delta_reacq:
+                hr_prev_hz = lisser_hr(best["freq"], hr_prev_hz, beta=hr_beta)
+                hr_last_valid_hz = hr_prev_hz
+                hr_last_valid_time = t_now
+                return hr_prev_hz
+
+        # sinon hold temporaire
+        if hr_last_valid_time is not None and (t_now - hr_last_valid_time) <= hold_max_s:
+            return hr_last_valid_hz
+
+        hr_prev_hz = np.nan
+        return np.nan
+
+    # ----------------------------------------
+    # Cas 2 : initialisation
+    # ----------------------------------------
+    plausibles = []
+    for c in valides:
+        rejet, _ = est_proche_harmonique(c["freq"], rr_hz, n_harm=5, tol=0.06)
+        if not rejet and 0.90 <= c["freq"] <= 2.00:
+            plausibles.append(c)
+
+    if len(plausibles) == 0:
+        if hr_last_valid_time is not None and (t_now - hr_last_valid_time) <= hold_max_s:
+            return hr_last_valid_hz
+        return np.nan
+
+    best = max(plausibles, key=lambda c: score_candidat_hr(c, np.nan, rr_hz))
+    hr_init_history.append(best["freq"])
+
+    # confirmation sur plusieurs fenêtres
+    if len(hr_init_history) >= hr_init_confirm_needed:
+        recent = np.array(list(hr_init_history)[-hr_init_confirm_needed:], dtype=np.float64)
+        if np.std(recent) < 0.12:
+            hr_prev_hz = float(np.mean(recent))
+            hr_last_valid_hz = hr_prev_hz
+            hr_last_valid_time = t_now
+            return hr_prev_hz
+
+    if hr_last_valid_time is not None and (t_now - hr_last_valid_time) <= hold_max_s:
+        return hr_last_valid_hz
+
+    return np.nan
 
 
 # ============================================================
@@ -258,7 +431,8 @@ try:
 
             if fs_est > 5.2:
                 sig_hr = filtre_passe_bande(phi_hp, 0.80, 2.50, fs_est)
-                hr_hz = frequence_dominante(sig_hr, fs_est, 0.80, 2.50)
+                hr_candidats = extraire_pics_spectraux(sig_hr, fs_est, 0.80, 2.50, max_peaks=6)
+                hr_hz = choisir_hr_robuste(hr_candidats, rr_hz, t_now)
 
             if np.isfinite(rr_hz):
                 rr_last = rr_hz
