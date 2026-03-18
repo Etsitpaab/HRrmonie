@@ -140,32 +140,68 @@ def frequence_dominante(signal, fs, fmin, fmax):
 
 
 # ============================================================
-# Suppression des harmoniques respiratoires
+# Suppression sélective des harmoniques respiratoires
 # ============================================================
-def suppression_harmoniques_rr(signal, fs, rr_hz, fmax_hr=2.5, largeur=0.05):
+def suppression_harmoniques_rr_selective(
+    signal,
+    fs,
+    rr_hz,
+    hr_band=(0.80, 2.00),
+    max_harm=8,
+    tol_detect=0.04,
+    notch_half_width=0.025,
+    ratio_seuil=2.2
+):
     """
-    Supprime RR et ses harmoniques jusqu'à fmax_hr au moyen de filtres coupe-bande.
-    largeur = demi-largeur autour de chaque harmonique.
+    Supprime seulement les harmoniques de RR qui :
+    1) tombent dans la bande HR
+    2) correspondent à un pic réellement présent dans le spectre
+
+    ratio_seuil : puissance locale / médiane locale minimale
     """
+
     x = np.asarray(signal, dtype=np.float64).copy()
-    nyq = fs / 2.0
 
     if not np.isfinite(rr_hz) or rr_hz <= 0:
         return x
 
-    k = 1
-    while True:
-        f0 = k * rr_hz
-        if f0 >= fmax_hr:
-            break
+    fmin_hr, fmax_hr = hr_band
+    nyq = fs / 2.0
 
-        f_low = f0 - largeur
-        f_high = f0 + largeur
+    f, P = spectre_fft(x, fs)
+    if f.size == 0:
+        return x
 
-        if f_low > 0 and f_high < nyq:
-            x = filtre_coupe_bande(x, f_low, f_high, fs, ordre=2)
+    for k in range(2, max_harm + 1):
+        fh = k * rr_hz
 
-        k += 1
+        # on ne traite que les harmoniques dans la bande HR utile
+        if fh < fmin_hr or fh > fmax_hr:
+            continue
+
+        # zone de détection autour de l'harmonique théorique
+        mask_local = (f >= fh - tol_detect) & (f <= fh + tol_detect)
+        if not np.any(mask_local):
+            continue
+
+        f_local = f[mask_local]
+        P_local = P[mask_local]
+
+        if len(P_local) < 3:
+            continue
+
+        idx_peak = int(np.argmax(P_local))
+        f_peak = float(f_local[idx_peak])
+        p_peak = float(P_local[idx_peak])
+        p_med = float(np.median(P_local) + 1e-12)
+
+        # notch seulement si un vrai pic est présent
+        if p_peak / p_med >= ratio_seuil:
+            f_low = f_peak - notch_half_width
+            f_high = f_peak + notch_half_width
+
+            if f_low > 0 and f_high < nyq and f_low < f_high:
+                x = filtre_coupe_bande(x, f_low, f_high, fs, ordre=2)
 
     return x
 
@@ -231,7 +267,7 @@ def selection_bin_verrouillee(z_bin):
 # ============================================================
 # Lissage léger live
 # ============================================================
-def lissage_exponentiel(x_new, x_old, beta=0.25):
+def lissage_exponentiel(x_new, x_old, beta=0.20):
     if not np.isfinite(x_new):
         return x_old
     if not np.isfinite(x_old):
@@ -319,19 +355,22 @@ try:
                 sig_rr = filtre_passe_bande(phi_hp, 0.10, 0.50, fs_est)
                 rr_hz = frequence_dominante(sig_rr, fs_est, 0.10, 0.50)
 
-            # 2) Suppression des harmoniques RR
-            phi_clean = suppression_harmoniques_rr(
+            # 2) Suppression sélective des harmoniques RR
+            phi_clean = suppression_harmoniques_rr_selective(
                 phi_hp,
                 fs_est,
                 rr_hz,
-                fmax_hr=2.5,
-                largeur=0.05
+                hr_band=(0.80, 2.00),
+                max_harm=8,
+                tol_detect=0.04,
+                notch_half_width=0.025,
+                ratio_seuil=2.2
             )
 
             # 3) Estimation HR sur signal nettoyé
             if fs_est > 5.2:
-                sig_hr = filtre_passe_bande(phi_clean, 0.80, 2.50, fs_est)
-                hr_hz = frequence_dominante(sig_hr, fs_est, 0.80, 2.50)
+                sig_hr = filtre_passe_bande(phi_clean, 0.80, 2.00, fs_est)
+                hr_hz = frequence_dominante(sig_hr, fs_est, 0.80, 2.00)
 
             # Lissage live léger
             if np.isfinite(rr_hz):
@@ -344,7 +383,7 @@ try:
 
             if (t_now - last_print) >= periode_affichage:
                 print(
-                    f"bin={idx_sel:3d} | fs={fs_est:6.2f} Hz | "
+                    f"bin={idx_sel:3d} | fs={fs_est:6.2f} Hz AAAAA | "
                     f"RR={rr_last:5.3f} Hz ({rr_rpm:6.2f} rpm) | "
                     f"HR={hr_last:5.3f} Hz ({hr_bpm:6.2f} bpm)"
                 )
