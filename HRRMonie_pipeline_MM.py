@@ -45,7 +45,7 @@ if return_code != 0:
 
 
 # ============================================================
-# Prétraitement IQ : suppression DC
+# Prétraitement IQ
 # ============================================================
 beta_dc = 0.01
 mean_I = None
@@ -124,53 +124,107 @@ def frequence_dominante(signal, fs, fmin, fmax):
 
     f_band = f[mask]
     P_band = P[mask]
+
     idx = np.argmax(P_band)
     return float(f_band[idx])
 
 
 # ============================================================
-# Range gating simple : bin thorax stabilisé
+# Range gating renforcé
 # ============================================================
 idx_lock = None
-lock_margin = 2
-reacq_period = 30
-reacq_count = 0
+lock_margin = 1              # plus serré
+perte_compteur = 0
+perte_max = 15               # avant ré-acquisition globale
+init_frames = 40             # phase d'initialisation
+init_bins = []
 
 
-def choisir_idx_stable(z_bin, idx_precedent, margin=2):
-    amp = np.abs(z_bin)
+def initialiser_bin(z_bin):
+    global idx_lock, init_bins
 
-    if idx_precedent is None:
-        return int(np.argmax(amp))
+    idx = int(np.argmax(np.abs(z_bin)))
+    init_bins.append(idx)
 
-    left = max(0, idx_precedent - margin)
-    right = min(len(amp), idx_precedent + margin + 1)
-    return left + int(np.argmax(amp[left:right]))
+    if len(init_bins) >= init_frames:
+        hist = np.bincount(init_bins, minlength=len(z_bin))
+        idx_lock = int(np.argmax(hist))
+        init_bins = []
+
+    return idx_lock
 
 
 def selection_bin_verrouillee(z_bin):
-    global idx_lock, reacq_count
+    global idx_lock, perte_compteur
 
-    if idx_lock is None or reacq_count >= reacq_period:
-        idx_lock = int(np.argmax(np.abs(z_bin)))
-        reacq_count = 0
+    amp = np.abs(z_bin)
+    n = len(amp)
+
+    if idx_lock is None:
+        initialiser_bin(z_bin)
+        idx_tmp = int(np.argmax(amp))
+        return z_bin[idx_tmp], idx_tmp
+
+    left = max(0, idx_lock - lock_margin)
+    right = min(n, idx_lock + lock_margin + 1)
+
+    idx_local = left + int(np.argmax(amp[left:right]))
+    amp_local = amp[idx_local]
+    amp_global = np.max(amp)
+
+    # si le local est trop faible par rapport au max global,
+    # on considère qu'on a peut-être perdu la cible
+    if amp_local < 0.45 * amp_global:
+        perte_compteur += 1
     else:
-        idx_lock = choisir_idx_stable(z_bin, idx_lock, margin=lock_margin)
+        perte_compteur = 0
+        idx_lock = idx_local
 
-    reacq_count += 1
+    # ré-acquisition seulement après plusieurs pertes successives
+    if perte_compteur >= perte_max:
+        idx_lock = int(np.argmax(amp))
+        perte_compteur = 0
 
-    left = max(0, idx_lock - 1)
-    right = min(len(z_bin), idx_lock + 2)
-    z_sel = np.mean(z_bin[left:right])
+    left_avg = max(0, idx_lock - 1)
+    right_avg = min(n, idx_lock + 2)
+    z_sel = np.mean(z_bin[left_avg:right_avg])
 
     return z_sel, idx_lock
 
 
 # ============================================================
-# Buffers
+# Motion gating
+# ============================================================
+def fenetre_stable(phi_hp, seuil_std=1.2, seuil_diff=0.25):
+    phi_hp = np.asarray(phi_hp, dtype=np.float64)
+
+    if len(phi_hp) < 20:
+        return False
+
+    dphi = np.diff(phi_hp)
+
+    cond_std = np.std(phi_hp) < seuil_std
+    cond_diff = np.std(dphi) < seuil_diff
+
+    return cond_std and cond_diff
+
+
+# ============================================================
+# Lissage de sortie
+# ============================================================
+def lissage_exp(valeur, precedent, beta=0.2):
+    if not np.isfinite(valeur):
+        return precedent
+    if precedent is None or not np.isfinite(precedent):
+        return valeur
+    return (1 - beta) * precedent + beta * valeur
+
+
+# ============================================================
+# Buffers / paramètres
 # ============================================================
 fenetre_signal = 20.0
-echantillons_min = 128
+echantillons_min = 256
 periode_affichage = 1.0
 periode_traitement = 0.5
 
@@ -182,14 +236,15 @@ beta_fs = 0.1
 last_print = time.perf_counter()
 last_processing = time.perf_counter()
 
+rr_lisse = None
+hr_lisse = None
+
 
 # ============================================================
 # Boucle principale
 # ============================================================
 try:
     while True:
-        t0 = time.perf_counter()
-
         code_erreur, resultat, tableau_IQ = uRAD_RP_SDK11.detection()
         if code_erreur != 0:
             close_program()
@@ -198,7 +253,7 @@ try:
         Q_brut = np.asarray(tableau_IQ[1], dtype=np.float64)
         z_bin = I_brut + 1j * Q_brut
 
-        # FMCW + range gating simple
+        # Range gating
         z_sel, idx_sel = selection_bin_verrouillee(z_bin)
 
         I_sel = float(np.real(z_sel))
@@ -214,7 +269,7 @@ try:
         buffer_t.append(t_now)
         buffer_phi.append(phase)
 
-        # Estimation fs
+        # fs
         if len(buffer_t) >= 2:
             dt = buffer_t[-1] - buffer_t[-2]
             if dt > 0:
@@ -226,7 +281,7 @@ try:
             buffer_t.popleft()
             buffer_phi.popleft()
 
-        # Traitement périodique, pas à chaque itération
+        # Traitement périodique
         if (
             fs_est is not None
             and len(buffer_phi) >= echantillons_min
@@ -235,25 +290,33 @@ try:
             phi = np.unwrap(np.array(buffer_phi, dtype=np.float64))
             phi_hp = filtre_passe_haut(phi, fs_est, fc=0.05)
 
+            stable = fenetre_stable(phi_hp)
+
             rr_hz = np.nan
             hr_hz = np.nan
 
-            if fs_est > 1.2:
-                sig_rr = filtre_passe_bande(phi_hp, 0.10, 0.50, fs_est)
-                rr_hz = frequence_dominante(sig_rr, fs_est, 0.10, 0.50)
+            if stable:
+                if fs_est > 1.2:
+                    sig_rr = filtre_passe_bande(phi_hp, 0.10, 0.50, fs_est)
+                    rr_hz = frequence_dominante(sig_rr, fs_est, 0.10, 0.50)
 
-            if fs_est > 5.2:
-                sig_hr = filtre_passe_bande(phi_hp, 0.80, 2.50, fs_est)
-                hr_hz = frequence_dominante(sig_hr, fs_est, 0.80, 2.50)
+                if fs_est > 5.2:
+                    sig_hr = filtre_passe_bande(phi_hp, 0.80, 2.50, fs_est)
+                    hr_hz = frequence_dominante(sig_hr, fs_est, 0.80, 2.50)
 
-            rr_rpm = rr_hz * 60.0 if np.isfinite(rr_hz) else np.nan
-            hr_bpm = hr_hz * 60.0 if np.isfinite(hr_hz) else np.nan
+                rr_lisse = lissage_exp(rr_hz, rr_lisse, beta=0.25)
+                hr_lisse = lissage_exp(hr_hz, hr_lisse, beta=0.25)
+
+            rr_rpm = rr_lisse * 60.0 if rr_lisse is not None and np.isfinite(rr_lisse) else np.nan
+            hr_bpm = hr_lisse * 60.0 if hr_lisse is not None and np.isfinite(hr_lisse) else np.nan
 
             if (t_now - last_print) >= periode_affichage:
+                etat = "stable" if stable else "mouvement"
                 print(
                     f"bin={idx_sel:3d} | fs={fs_est:6.2f} Hz | "
-                    f"RR={rr_hz:5.3f} Hz ({rr_rpm:6.2f} rpm) | "
-                    f"HR={hr_hz:5.3f} Hz ({hr_bpm:6.2f} bpm)"
+                    f"etat={etat} | "
+                    f"RR={rr_lisse if rr_lisse is not None else np.nan:5.3f} Hz ({rr_rpm:6.2f} rpm) | "
+                    f"HR={hr_lisse if hr_lisse is not None else np.nan:5.3f} Hz ({hr_bpm:6.2f} bpm)"
                 )
                 last_print = t_now
 
