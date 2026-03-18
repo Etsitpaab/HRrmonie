@@ -124,7 +124,6 @@ def frequence_dominante(signal, fs, fmin, fmax):
 
     f_band = f[mask]
     P_band = P[mask]
-
     idx = np.argmax(P_band)
     return float(f_band[idx])
 
@@ -133,10 +132,10 @@ def frequence_dominante(signal, fs, fmin, fmax):
 # Range gating renforcé
 # ============================================================
 idx_lock = None
-lock_margin = 1              # plus serré
+lock_margin = 1
 perte_compteur = 0
-perte_max = 15               # avant ré-acquisition globale
-init_frames = 40             # phase d'initialisation
+perte_max = 20
+init_frames = 50
 init_bins = []
 
 
@@ -150,8 +149,6 @@ def initialiser_bin(z_bin):
         hist = np.bincount(init_bins, minlength=len(z_bin))
         idx_lock = int(np.argmax(hist))
         init_bins = []
-
-    return idx_lock
 
 
 def selection_bin_verrouillee(z_bin):
@@ -172,15 +169,12 @@ def selection_bin_verrouillee(z_bin):
     amp_local = amp[idx_local]
     amp_global = np.max(amp)
 
-    # si le local est trop faible par rapport au max global,
-    # on considère qu'on a peut-être perdu la cible
-    if amp_local < 0.45 * amp_global:
+    if amp_local < 0.50 * amp_global:
         perte_compteur += 1
     else:
         perte_compteur = 0
         idx_lock = idx_local
 
-    # ré-acquisition seulement après plusieurs pertes successives
     if perte_compteur >= perte_max:
         idx_lock = int(np.argmax(amp))
         perte_compteur = 0
@@ -193,31 +187,57 @@ def selection_bin_verrouillee(z_bin):
 
 
 # ============================================================
-# Motion gating
+# Motion gating robuste avec hystérésis
 # ============================================================
-def fenetre_stable(phi_hp, seuil_std=1.2, seuil_diff=0.25):
+etat_stable = False
+stable_count = 0
+unstable_count = 0
+
+# nombre de validations consécutives avant changement d'état
+stable_needed = 4
+unstable_needed = 6
+
+
+def metriques_stabilite(phi_hp):
     phi_hp = np.asarray(phi_hp, dtype=np.float64)
 
     if len(phi_hp) < 20:
-        return False
+        return np.inf, np.inf
 
     dphi = np.diff(phi_hp)
-
-    cond_std = np.std(phi_hp) < seuil_std
-    cond_diff = np.std(dphi) < seuil_diff
-
-    return cond_std and cond_diff
+    return float(np.std(phi_hp)), float(np.std(dphi))
 
 
-# ============================================================
-# Lissage de sortie
-# ============================================================
-def lissage_exp(valeur, precedent, beta=0.2):
-    if not np.isfinite(valeur):
-        return precedent
-    if precedent is None or not np.isfinite(precedent):
-        return valeur
-    return (1 - beta) * precedent + beta * valeur
+def maj_etat_stabilite(phi_hp):
+    global etat_stable, stable_count, unstable_count
+
+    std_phi, std_dphi = metriques_stabilite(phi_hp)
+
+    # Hystérésis :
+    # - pour devenir stable : seuils stricts
+    # - pour rester stable : seuils plus permissifs
+    if not etat_stable:
+        cond_stable = (std_phi < 1.00) and (std_dphi < 0.18)
+        if cond_stable:
+            stable_count += 1
+        else:
+            stable_count = 0
+
+        if stable_count >= stable_needed:
+            etat_stable = True
+            unstable_count = 0
+    else:
+        cond_instable = (std_phi > 1.35) or (std_dphi > 0.30)
+        if cond_instable:
+            unstable_count += 1
+        else:
+            unstable_count = 0
+
+        if unstable_count >= unstable_needed:
+            etat_stable = False
+            stable_count = 0
+
+    return etat_stable, std_phi, std_dphi
 
 
 # ============================================================
@@ -236,8 +256,8 @@ beta_fs = 0.1
 last_print = time.perf_counter()
 last_processing = time.perf_counter()
 
-rr_lisse = None
-hr_lisse = None
+rr_last = np.nan
+hr_last = np.nan
 
 
 # ============================================================
@@ -253,7 +273,7 @@ try:
         Q_brut = np.asarray(tableau_IQ[1], dtype=np.float64)
         z_bin = I_brut + 1j * Q_brut
 
-        # Range gating
+        # Bin thorax stabilisé
         z_sel, idx_sel = selection_bin_verrouillee(z_bin)
 
         I_sel = float(np.real(z_sel))
@@ -269,7 +289,7 @@ try:
         buffer_t.append(t_now)
         buffer_phi.append(phase)
 
-        # fs
+        # Estimation fs
         if len(buffer_t) >= 2:
             dt = buffer_t[-1] - buffer_t[-2]
             if dt > 0:
@@ -290,12 +310,12 @@ try:
             phi = np.unwrap(np.array(buffer_phi, dtype=np.float64))
             phi_hp = filtre_passe_haut(phi, fs_est, fc=0.05)
 
-            stable = fenetre_stable(phi_hp)
-
-            rr_hz = np.nan
-            hr_hz = np.nan
+            stable, std_phi, std_dphi = maj_etat_stabilite(phi_hp)
 
             if stable:
+                rr_hz = np.nan
+                hr_hz = np.nan
+
                 if fs_est > 1.2:
                     sig_rr = filtre_passe_bande(phi_hp, 0.10, 0.50, fs_est)
                     rr_hz = frequence_dominante(sig_rr, fs_est, 0.10, 0.50)
@@ -304,19 +324,21 @@ try:
                     sig_hr = filtre_passe_bande(phi_hp, 0.80, 2.50, fs_est)
                     hr_hz = frequence_dominante(sig_hr, fs_est, 0.80, 2.50)
 
-                rr_lisse = lissage_exp(rr_hz, rr_lisse, beta=0.25)
-                hr_lisse = lissage_exp(hr_hz, hr_lisse, beta=0.25)
+                if np.isfinite(rr_hz):
+                    rr_last = rr_hz
+                if np.isfinite(hr_hz):
+                    hr_last = hr_hz
 
-            rr_rpm = rr_lisse * 60.0 if rr_lisse is not None and np.isfinite(rr_lisse) else np.nan
-            hr_bpm = hr_lisse * 60.0 if hr_lisse is not None and np.isfinite(hr_lisse) else np.nan
+            rr_rpm = rr_last * 60.0 if np.isfinite(rr_last) else np.nan
+            hr_bpm = hr_last * 60.0 if np.isfinite(hr_last) else np.nan
 
             if (t_now - last_print) >= periode_affichage:
-                etat = "stable" if stable else "mouvement"
                 print(
                     f"bin={idx_sel:3d} | fs={fs_est:6.2f} Hz | "
-                    f"etat={etat} | "
-                    f"RR={rr_lisse if rr_lisse is not None else np.nan:5.3f} Hz ({rr_rpm:6.2f} rpm) | "
-                    f"HR={hr_lisse if hr_lisse is not None else np.nan:5.3f} Hz ({hr_bpm:6.2f} bpm)"
+                    f"etat={'stable' if stable else 'mouvement'} | "
+                    f"std_phi={std_phi:5.3f} | std_dphi={std_dphi:5.3f} | "
+                    f"RR={rr_last:5.3f} Hz ({rr_rpm:6.2f} rpm) | "
+                    f"HR={hr_last:5.3f} Hz ({hr_bpm:6.2f} bpm)"
                 )
                 last_print = t_now
 
