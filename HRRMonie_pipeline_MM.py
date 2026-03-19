@@ -1,3 +1,4 @@
+
 import time
 import numpy as np
 from scipy.signal import butter, sosfiltfilt, find_peaks, get_window
@@ -31,26 +32,32 @@ movement_true = False
 HR_MIN_HZ = 0.90          # 54 bpm
 HR_MAX_HZ = 2.00          # 120 bpm
 HR_HALF_BAND_HZ = 0.35    # bande adaptative +/- 21 bpm
-HR_HARD_JUMP_HZ = 0.18    # plus permissif pour éviter le gel du tracking
+HR_HARD_JUMP_HZ = 0.18    # tracking un peu plus permissif
 HR_ALPHA_TRACK = 0.12
 HR_SNR_MIN = 2.5
 HR_PROM_MIN = 0.015
 HR_MEDIAN_LEN = 7
-HR_EMA_ALPHA = 0.25       # conservé pour compatibilité, remplacé par adaptive_alpha au runtime
 
 RR_MIN_HZ = 0.10
 RR_MAX_HZ = 0.50
 
-TARGET_SMOOTH_ALPHA = 0.15
-TARGET_REACQ_PERIOD = 120
-TARGET_NEIGHBOR_MARGIN = 1
+# =========================
+# Paramètres spécifiques CW
+# =========================
+# En mode CW, on évite de "tracker un bin distance" comme en FMCW.
+# On combine plutôt plusieurs composantes I/Q stables pour extraire une phase globale.
+CW_SCORE_ALPHA = 0.10
+CW_TOPK_BINS = 5
+CW_WEIGHT_POWER = 1.5
 
 # =========================
 # Utilitaires radar
 # =========================
 def closeProgram():
-    uRAD_RP_SDK11.turnOFF()
-    raise SystemExit
+    try:
+        uRAD_RP_SDK11.turnOFF()
+    finally:
+        raise SystemExit
 
 return_code = uRAD_RP_SDK11.turnON()
 if return_code != 0:
@@ -163,7 +170,6 @@ def filtre_pass_haut(signal, freq_echanti, fc=0.05):
     sos = butter(4, fc / nyq, btype='highpass', output='sos')
     return sosfiltfilt(sos, signal)
 
-
 def passe_bande(signal, f_basse, f_haut, freq_echanti, ordre=4):
     signal = np.asarray(signal, dtype=np.float64)
     nyq = freq_echanti / 2.0
@@ -173,7 +179,6 @@ def passe_bande(signal, f_basse, f_haut, freq_echanti, ordre=4):
 
     sos = butter(ordre, [f_basse / nyq, f_haut / nyq], btype='bandpass', output='sos')
     return sosfiltfilt(sos, signal)
-
 
 def notch_resp_harmonics(signal, fs, f_rr, max_harm=6, bw=0.06):
     """
@@ -220,7 +225,6 @@ def puissance_spectre(x, fs, nfft=None, window="hann"):
     f = np.fft.rfftfreq(nfft, d=1.0 / fs)
     return f, Pxx
 
-
 def qualite_pics(frequence, Pxx, fmin, fmax):
     bande = (frequence >= fmin) & (frequence <= fmax)
     frequence_bande = frequence[bande]
@@ -251,7 +255,6 @@ def qualite_pics(frequence, Pxx, fmin, fmax):
     prominence_norm = prom / pic_pow
 
     return frequence_pic, SNR_db, prominence_norm
-
 
 def FFT_glissante(x, freq, freq_min, freq_max, duree_fenetre=20.0):
     x = np.asarray(x, dtype=np.float64)
@@ -286,7 +289,6 @@ def FFT_glissante(x, freq, freq_min, freq_max, duree_fenetre=20.0):
         np.array(prominence)
     )
 
-
 def tracking_freq(freq_est, snr_db, prom_norm, saut_max=0.15, alph=0.3, snr_min=3.0, prom_min=0.02):
     f_est = np.asarray(freq_est, dtype=np.float64)
     snr_db = np.asarray(snr_db, dtype=np.float64)
@@ -304,8 +306,7 @@ def tracking_freq(freq_est, snr_db, prom_norm, saut_max=0.15, alph=0.3, snr_min=
         if np.isfinite(f_prev):
             delta = abs(f - f_prev)
             if delta > saut_max:
-                # Au lieu de rejeter brutalement la mesure, on l'amortit
-                # pour éviter trous/NaN et recoller doucement au nouveau pic.
+                # En CW, mieux vaut amortir qu'annuler brutalement.
                 f = 0.7 * f_prev + 0.3 * f
             f_lisse = (1 - alph) * f_prev + alph * f
         else:
@@ -329,7 +330,6 @@ def estimation_rr(signal_rr, fs, duree_fenetre=20.0):
     f_tr = tracking_freq(f, snr, prom, saut_max=0.05, alph=0.20, snr_min=3.0, prom_min=0.02)
     rpm = f_tr * 60.0
     return t, rpm, snr, prom, f_tr
-
 
 def estimation_hr(signal_hr, fs, hr_prev_hz=None, duree_fenetre=18.0):
     # 1) Bande adaptative
@@ -371,7 +371,7 @@ def estimation_hr(signal_hr, fs, hr_prev_hz=None, duree_fenetre=18.0):
         )
         f_tr = tracking_freq(
             f, snr, prom,
-            saut_max=0.18,
+            saut_max=0.20,
             alph=0.20,
             snr_min=2.0,
             prom_min=0.01
@@ -380,18 +380,49 @@ def estimation_hr(signal_hr, fs, hr_prev_hz=None, duree_fenetre=18.0):
     bpm = f_tr * 60.0
     return t, bpm, snr, prom, f_tr
 
-
 def filtre_mediane_simple(valeurs):
     vals = [v for v in valeurs if np.isfinite(v)]
     if not vals:
         return np.nan
     return float(np.median(vals))
 
-
 def adaptive_alpha(snr):
     if not np.isfinite(snr):
         return 0.10
     return float(np.clip(snr / 20.0, 0.05, 0.30))
+
+# =========================
+# Combinaison CW des composantes I/Q
+# =========================
+score_bins = None
+
+def init_score_bins(nbins):
+    global score_bins
+    if score_bins is None or len(score_bins) != nbins:
+        score_bins = np.zeros(nbins, dtype=np.float64)
+
+def combine_cw_bins(z_bin, topk=CW_TOPK_BINS):
+    """
+    En mode CW, on évite de choisir un seul bin comme en FMCW.
+    On combine plusieurs composantes les plus énergétiques avec des poids lissés.
+    """
+    global score_bins
+
+    amp = np.abs(z_bin).astype(np.float64)
+    init_score_bins(len(amp))
+    score_bins = (1.0 - CW_SCORE_ALPHA) * score_bins + CW_SCORE_ALPHA * amp
+
+    k = int(max(1, min(topk, len(score_bins))))
+    idx_top = np.argpartition(score_bins, -k)[-k:]
+    idx_top = idx_top[np.argsort(score_bins[idx_top])[::-1]]
+
+    poids = np.power(score_bins[idx_top] + 1e-12, CW_WEIGHT_POWER)
+    poids = poids / (np.sum(poids) + 1e-12)
+
+    z_sel = np.sum(z_bin[idx_top] * poids)
+    idx_debug = int(idx_top[0])
+
+    return z_sel, idx_debug, idx_top, poids
 
 # =========================
 # Affichage constellation
@@ -427,48 +458,9 @@ marqueur_print = time.time()
 fs_est = None
 beta_fs = 0.05
 
-idx_lock = None
-reacq_count = 0
-score_bins = None
-
 hr_history = deque(maxlen=HR_MEDIAN_LEN)
 hr_last_stable_hz = np.nan
 hr_last_output = np.nan
-
-
-def init_score_bins(nbins):
-    global score_bins
-    if score_bins is None or len(score_bins) != nbins:
-        score_bins = np.zeros(nbins, dtype=np.float64)
-
-
-def choisir_idx_stable(z_bin, idx_precedent):
-    global score_bins
-
-    amp = np.abs(z_bin)
-    init_score_bins(len(amp))
-
-    # lissage temporel du score par bin
-    score_bins = (1.0 - TARGET_SMOOTH_ALPHA) * score_bins + TARGET_SMOOTH_ALPHA * amp
-
-    if idx_precedent is None:
-        return int(np.argmax(score_bins))
-
-    # sécurité si l'ancien index sort de la plage
-    idx_precedent = int(np.clip(idx_precedent, 0, len(score_bins) - 1))
-
-    # pénalisation globale par distance pour limiter les sauts de bin
-    indices = np.arange(len(score_bins))
-    dist_penalty = np.abs(indices - idx_precedent)
-    score = score_bins - 0.4 * dist_penalty
-
-    idx_new = int(np.argmax(score))
-
-    # hysteresis : si saut violent, on garde le bin précédent
-    if abs(idx_new - idx_precedent) > 3:
-        return idx_precedent
-
-    return idx_new
 
 # =========================
 # Boucle principale
@@ -484,22 +476,8 @@ try:
         Q_brut = np.asarray(tableau_IQ[1], dtype=np.float64)
         z_bin = I_brut + 1j * Q_brut
 
-        # Verrouillage de cible plus stable
-        if idx_lock is None or reacq_count >= TARGET_REACQ_PERIOD:
-            init_score_bins(len(z_bin))
-            score_bins = np.abs(z_bin).astype(np.float64)
-            idx_lock = int(np.argmax(score_bins))
-            reacq_count = 0
-        else:
-            idx_lock = choisir_idx_stable(z_bin, idx_lock)
-
-        reacq_count += 1
-
-        # Moyenne locale autour du bin verrouillé
-        left = max(0, idx_lock - TARGET_NEIGHBOR_MARGIN)
-        right = min(len(z_bin), idx_lock + TARGET_NEIGHBOR_MARGIN + 1)
-        z_roi = z_bin[left:right]
-        z_sel = np.mean(z_roi)
+        # En mode CW : combinaison pondérée multi-composantes plutôt que tracking d'un bin unique
+        z_sel, idx_debug, idx_top, poids_top = combine_cw_bins(z_bin, topk=CW_TOPK_BINS)
 
         I_sel = float(np.real(z_sel))
         Q_sel = float(np.imag(z_sel))
@@ -601,14 +579,14 @@ try:
                     hr_snr_out = np.nan
                     hr_prom_out = np.nan
 
-                # Mise à jour du HR lissé avec alpha adaptatif au SNR
+                # Lissage de sortie adaptatif au SNR
                 if np.isfinite(hr_out_raw):
                     hr_history.append(hr_out_raw)
                     hr_med = filtre_mediane_simple(hr_history)
 
                     if np.isfinite(hr_med):
-                        alpha = adaptive_alpha(hr_snr_out)
                         if np.isfinite(hr_last_output):
+                            alpha = adaptive_alpha(hr_snr_out)
                             hr_last_output = (1.0 - alpha) * hr_last_output + alpha * hr_med
                         else:
                             hr_last_output = hr_med
@@ -617,6 +595,8 @@ try:
 
                 hr_print = hr_last_output if np.isfinite(hr_last_output) else np.nan
 
+                top_bins_str = ",".join(str(int(v)) for v in idx_top[:min(3, len(idx_top))])
+
                 print(
                     f"RR: {rr_out:.2f} rpm | "
                     f"HR: {hr_print:.2f} bpm | "
@@ -624,7 +604,8 @@ try:
                     f"SNR_HR: {hr_snr_out:.2f} dB | "
                     f"PROM_HR: {hr_prom_out:.4f} | "
                     f"HR_ref_hz: {hr_last_stable_hz:.3f} | "
-                    f"bin: {idx_lock}"
+                    f"bin_dbg: {idx_debug} | "
+                    f"top_bins: [{top_bins_str}]"
                 )
 
                 marqueur_print = t_now
