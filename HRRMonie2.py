@@ -7,9 +7,9 @@ from scipy.signal import butter, sosfiltfilt, get_window
 import uRAD_RP_SDK11
 
 # =========================
-# CONFIG FMCW (MANUEL OK)
+# CONFIG RADAR FMCW
 # =========================
-mode = 4  # FMCW Dual Rate
+mode = 4
 f0 = 5
 BW = 240
 Ns = 200
@@ -44,13 +44,27 @@ if uRAD_RP_SDK11.loadConfiguration(
     closeProgram()
 
 # =========================
+# PARAMÈTRES HR
+# =========================
+HR_MIN = 50
+HR_MAX = 120
+HR_MAX_STEP = 4.0
+HR_ACCEPT_DIFF = 8.0
+HR_ALPHA = 0.15
+HR_MEDIAN_LEN = 5
+HR_SNR_MIN = 2.0
+
+# =========================
 # BUFFERS
 # =========================
 buffer_phi = deque()
 buffer_t = deque()
+hr_buffer = deque(maxlen=HR_MEDIAN_LEN)
 
 WINDOW_SECONDS = 30
 MIN_SAMPLES = 200
+
+hr_prev = None
 
 # =========================
 # FILTRES
@@ -66,26 +80,29 @@ def highpass(x, fs):
     return sosfiltfilt(sos, x)
 
 # =========================
-# RANGE FFT (FMCW)
+# RANGE FFT
 # =========================
 def range_fft(I, Q):
-    z = I + 1j*Q
-    return np.fft.fft(z)
+    return np.fft.fft(I + 1j*Q)
 
 def select_bin(Z, prev_idx=None):
     amp = np.abs(Z)
 
+    # suppression DC
+    amp[:5] = 0
+
     if prev_idx is None:
         return np.argmax(amp)
 
-    # stabilisation légère
-    local = amp[max(0, prev_idx-2):prev_idx+3]
-    idx_local = np.argmax(local) + max(0, prev_idx-2)
+    low = max(5, prev_idx - 3)
+    high = min(len(amp), prev_idx + 4)
 
-    if amp[idx_local] > 0.9 * amp[prev_idx]:
+    idx_local = np.argmax(amp[low:high]) + low
+
+    if amp[idx_local] > 0.8 * amp[prev_idx]:
         return idx_local
 
-    return np.argmax(amp)
+    return prev_idx
 
 # =========================
 # PHASE
@@ -102,6 +119,7 @@ def unwrap(p):
         return p
 
     dp = p - phase_prev
+
     if dp > np.pi:
         dp -= 2*np.pi
     elif dp < -np.pi:
@@ -112,9 +130,11 @@ def unwrap(p):
     return phase_unwrapped
 
 # =========================
-# HR SIMPLE
+# HR TRACKING
 # =========================
-def compute_hr(sig, fs):
+def compute_hr_tracked(sig, fs):
+    global hr_prev, hr_buffer
+
     N = len(sig)
     X = np.fft.rfft(sig * get_window("hann", N))
     P = np.abs(X)**2
@@ -124,15 +144,47 @@ def compute_hr(sig, fs):
     f = f[mask]
     P = P[mask]
 
-    return f[np.argmax(P)] * 60
+    idx = np.argmax(P)
+    f_peak = f[idx]
+    hr_raw = f_peak * 60
+
+    noise = np.median(P)
+    snr = P[idx] / (noise + 1e-9)
+
+    if snr < HR_SNR_MIN:
+        return hr_prev if hr_prev is not None else hr_raw
+
+    if hr_prev is None:
+        hr_prev = hr_raw
+        hr_buffer.append(hr_raw)
+        return hr_raw
+
+    # validation
+    if abs(hr_raw - hr_prev) > HR_ACCEPT_DIFF:
+        hr_raw = hr_prev
+
+    # limitation variation
+    delta = hr_raw - hr_prev
+    delta = np.clip(delta, -HR_MAX_STEP, HR_MAX_STEP)
+    hr_new = hr_prev + delta
+
+    # lissage
+    hr_new = (1 - HR_ALPHA) * hr_prev + HR_ALPHA * hr_new
+
+    hr_buffer.append(hr_new)
+    hr_final = np.median(hr_buffer)
+
+    hr_prev = hr_final
+
+    return hr_final
 
 # =========================
-# PLOT HR
+# PLOT
 # =========================
 plt.ion()
 fig, ax = plt.subplots()
 line, = ax.plot([], [])
-ax.set_ylim(40, 140)
+ax.set_ylim(40, 120)
 
 times = []
 hrs = []
@@ -153,31 +205,21 @@ while True:
     I = np.array(raw[0])
     Q = np.array(raw[1])
 
-    # =========================
-    # DÉCOUPAGE FMCW MODE 4
-    # =========================
-    # 1ère rampe uniquement (Ns up)
+    # FMCW : première rampe
     I_up = I[:Ns]
     Q_up = Q[:Ns]
 
-    # =========================
-    # FFT DISTANCE
-    # =========================
     Z = range_fft(I_up, Q_up)
     idx_lock = select_bin(Z, idx_lock)
 
     z_sel = Z[idx_lock]
 
-    # =========================
-    # PHASE
-    # =========================
     phi = unwrap(np.angle(z_sel))
 
     t_now = time.time()
     buffer_phi.append(phi)
     buffer_t.append(t_now)
 
-    # fs estimation
     if len(buffer_t) > 1:
         dt = buffer_t[-1] - buffer_t[-2]
         fs_inst = 1.0 / max(dt, 1e-6)
@@ -193,20 +235,14 @@ while True:
     phi_arr = np.array(buffer_phi)
     fs = fs_est
 
-    # =========================
-    # PIPELINE HR
-    # =========================
     phi_hp = highpass(phi_arr, fs)
     phi_diff = np.diff(phi_hp, prepend=phi_hp[0])
     sig_hr = bandpass(phi_diff, 0.8, 2.0, fs)
 
-    hr = compute_hr(sig_hr, fs)
+    hr = compute_hr_tracked(sig_hr, fs)
 
     print(f"HR: {hr:.2f} bpm | bin: {idx_lock}")
 
-    # =========================
-    # GRAPH
-    # =========================
     times.append(t_now)
     hrs.append(hr)
 
