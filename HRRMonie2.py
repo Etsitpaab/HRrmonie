@@ -44,12 +44,11 @@ if uRAD_RP_SDK11.loadConfiguration(
     closeProgram()
 
 # =========================
-# PARAMÈTRES HR
+# PARAMÈTRES
 # =========================
-HR_MIN = 50
-HR_MAX = 120
-HR_MAX_STEP = 4.0
-HR_ACCEPT_DIFF = 8.0
+TARGET_FS = 20.0  # Hz
+
+HR_MAX_STEP = 8.0
 HR_ALPHA = 0.15
 HR_MEDIAN_LEN = 5
 HR_SNR_MIN = 2.0
@@ -140,7 +139,8 @@ def compute_hr_tracked(sig, fs):
     P = np.abs(X)**2
     f = np.fft.rfftfreq(N, 1/fs)
 
-    mask = (f > 0.8) & (f < 2.0)
+    # bande cardiaque stricte
+    mask = (f > 0.9) & (f < 1.8)
     f = f[mask]
     P = P[mask]
 
@@ -159,9 +159,9 @@ def compute_hr_tracked(sig, fs):
         hr_buffer.append(hr_raw)
         return hr_raw
 
-    # validation
-    if abs(hr_raw - hr_prev) > HR_ACCEPT_DIFF:
-        hr_raw = hr_prev
+    # correction douce si incohérent
+    if abs(hr_raw - hr_prev) > 12:
+        hr_raw = hr_prev + np.sign(hr_raw - hr_prev) * 6
 
     # limitation variation
     delta = hr_raw - hr_prev
@@ -193,10 +193,19 @@ hrs = []
 # MAIN LOOP
 # =========================
 idx_lock = None
-fs_est = None
-beta_fs = 0.05
+last_time = time.time()
 
 while True:
+
+    # contrôle fréquence acquisition
+    t_now = time.time()
+    dt = t_now - last_time
+
+    if dt < 1.0 / TARGET_FS:
+        time.sleep((1.0 / TARGET_FS) - dt)
+        t_now = time.time()
+
+    last_time = t_now
 
     code, _, raw = uRAD_RP_SDK11.detection()
     if code != 0:
@@ -216,14 +225,8 @@ while True:
 
     phi = unwrap(np.angle(z_sel))
 
-    t_now = time.time()
     buffer_phi.append(phi)
     buffer_t.append(t_now)
-
-    if len(buffer_t) > 1:
-        dt = buffer_t[-1] - buffer_t[-2]
-        fs_inst = 1.0 / max(dt, 1e-6)
-        fs_est = fs_inst if fs_est is None else (1-beta_fs)*fs_est + beta_fs*fs_inst
 
     while buffer_t[-1] - buffer_t[0] > WINDOW_SECONDS:
         buffer_t.popleft()
@@ -233,15 +236,15 @@ while True:
         continue
 
     phi_arr = np.array(buffer_phi)
-    fs = fs_est
+    fs = TARGET_FS
 
     phi_hp = highpass(phi_arr, fs)
     phi_diff = np.diff(phi_hp, prepend=phi_hp[0])
-    sig_hr = bandpass(phi_diff, 0.8, 2.0, fs)
+    sig_hr = bandpass(phi_diff, 0.9, 1.8, fs)
 
     hr = compute_hr_tracked(sig_hr, fs)
 
-    print(f"HR: {hr:.2f} bpm | bin: {idx_lock}")
+    print(f"HR_raw tracking -> {hr:.2f} bpm | bin: {idx_lock}")
 
     times.append(t_now)
     hrs.append(hr)
