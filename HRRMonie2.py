@@ -1,4 +1,6 @@
 import time
+import csv
+import os
 import numpy as np
 from scipy.signal import butter, sosfiltfilt, find_peaks, get_window
 import uRAD_RP_SDK11
@@ -31,31 +33,110 @@ movement_true = False
 HR_MIN_HZ = 0.90          # 54 bpm
 HR_MAX_HZ = 2.00          # 120 bpm
 HR_HALF_BAND_HZ = 0.35    # bande adaptative +/- 21 bpm
-HR_HARD_JUMP_HZ = 0.12    # tracking moins strict
-HR_ALPHA_TRACK = 0.12
+HR_HARD_JUMP_HZ = 0.18    # un peu plus permissif
+HR_ALPHA_TRACK = 0.14
 HR_SNR_MIN = 2.5
 HR_PROM_MIN = 0.015
-HR_MEDIAN_LEN = 7
-HR_EMA_ALPHA = 0.25
+HR_MEDIAN_LEN = 5
+HR_EMA_ALPHA = 0.18
+HR_CATCHUP_ALPHA = 0.55
+HR_CATCHUP_DELTA_BPM = 4.0
+HR_CATCHUP_STREAK = 3
+HR_MAX_INVALID_STREAK = 5
+HR_MULTI_PEAKS = 3
+HR_HARM_PENALTY_HZ = 0.06
+HR_HARM_PENALTY_GAIN = 0.55
+HR_MAX_HARM_REJECT = 8
 
 RR_MIN_HZ = 0.10
 RR_MAX_HZ = 0.50
 
 TARGET_SMOOTH_ALPHA = 0.15
-TARGET_REACQ_PERIOD = 160
+TARGET_REACQ_PERIOD = 120
 TARGET_NEIGHBOR_MARGIN = 1
-TARGET_LOCAL_SEARCH_RADIUS = 2
-TARGET_SWITCH_RATIO = 1.18
-TARGET_REACQ_RATIO = 1.45
-TARGET_SWITCH_HOLD = 4
-TARGET_DROP_RATIO = 0.70
+TARGET_LOCAL_MARGIN = 2
+TARGET_SWITCH_RATIO = 1.10
+TARGET_GLOBAL_CONFIRM = 3
+TARGET_FAR_JUMP_MAX = 4
+
+# =========================
+# Logging
+# =========================
+LOG_ENABLED = True
+LOG_DIR = "logs_hr"
+LOG_PREFIX = "vitals_log"
+LOG_FLUSH_EVERY = 1
+
+log_writer = None
+log_file_handle = None
+log_path = None
+log_counter = 0
+
+
+def init_logging():
+    global log_writer, log_file_handle, log_path
+    if not LOG_ENABLED:
+        return
+    os.makedirs(LOG_DIR, exist_ok=True)
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    log_path = os.path.join(LOG_DIR, f"{LOG_PREFIX}_{ts}.csv")
+    log_file_handle = open(log_path, "w", newline="", encoding="utf-8")
+    log_writer = csv.writer(log_file_handle)
+    log_writer.writerow([
+        "timestamp",
+        "fs",
+        "idx_lock",
+        "idx_local_best",
+        "idx_global_best",
+        "rr_rpm",
+        "rr_hz",
+        "rr_snr_db",
+        "hr_out_bpm",
+        "hr_raw_bpm",
+        "hr_med_bpm",
+        "hr_peak_freq_hz",
+        "hr_peak_snr_db",
+        "hr_peak_prom",
+        "hr_peak_penalty",
+        "hr_candidate_1_bpm",
+        "hr_candidate_1_score",
+        "hr_candidate_2_bpm",
+        "hr_candidate_2_score",
+        "hr_candidate_3_bpm",
+        "hr_candidate_3_score",
+        "phase_last",
+        "bin_amp",
+        "reacq_count",
+        "invalid_hr_streak"
+    ])
+    log_file_handle.flush()
+    print(f"[LOG] CSV: {log_path}")
+
+
+def write_log(row):
+    global log_counter
+    if not LOG_ENABLED or log_writer is None:
+        return
+    log_writer.writerow(row)
+    log_counter += 1
+    if log_counter % LOG_FLUSH_EVERY == 0:
+        log_file_handle.flush()
+
 
 # =========================
 # Utilitaires radar
 # =========================
 def closeProgram():
-    uRAD_RP_SDK11.turnOFF()
+    global log_file_handle
+    try:
+        if log_file_handle is not None:
+            log_file_handle.flush()
+            log_file_handle.close()
+            log_file_handle = None
+    finally:
+        uRAD_RP_SDK11.turnOFF()
     raise SystemExit
+
 
 return_code = uRAD_RP_SDK11.turnON()
 if return_code != 0:
@@ -69,6 +150,8 @@ return_code = uRAD_RP_SDK11.loadConfiguration(
 if return_code != 0:
     closeProgram()
 
+init_logging()
+
 # =========================
 # Prétraitement pour affichage IQ
 # =========================
@@ -80,6 +163,7 @@ moyenne_I_iq = None
 moyenne_Q_iq = None
 variance_I_iq = None
 variance_Q_iq = None
+
 
 def pretraitement_affichage_iq(I_entree, Q_entree):
     global moyenne_I_iq, moyenne_Q_iq, variance_I_iq, variance_Q_iq
@@ -105,12 +189,14 @@ def pretraitement_affichage_iq(I_entree, Q_entree):
 
     return I_normalise, Q_normalise
 
+
 # =========================
 # Prétraitement pour la phase
 # =========================
 beta_dc_phase = 0.01
 moyenne_I_phase = None
 moyenne_Q_phase = None
+
 
 def pretraitement_phase(I_entree, Q_entree):
     global moyenne_I_phase, moyenne_Q_phase
@@ -130,11 +216,13 @@ def pretraitement_phase(I_entree, Q_entree):
 
     return I_centre, Q_centre
 
+
 # =========================
 # Dépliage de phase
 # =========================
 phase_deplie = 0.0
 phase_precedente = None
+
 
 def unwrap_phase(phase_actuelle):
     global phase_deplie, phase_precedente
@@ -155,6 +243,7 @@ def unwrap_phase(phase_actuelle):
     phase_precedente = phase_actuelle
     return phase_deplie
 
+
 # =========================
 # Filtres
 # =========================
@@ -168,6 +257,7 @@ def filtre_pass_haut(signal, freq_echanti, fc=0.05):
     sos = butter(4, fc / nyq, btype='highpass', output='sos')
     return sosfiltfilt(sos, signal)
 
+
 def passe_bande(signal, f_basse, f_haut, freq_echanti, ordre=4):
     signal = np.asarray(signal, dtype=np.float64)
     nyq = freq_echanti / 2.0
@@ -178,10 +268,8 @@ def passe_bande(signal, f_basse, f_haut, freq_echanti, ordre=4):
     sos = butter(ordre, [f_basse / nyq, f_haut / nyq], btype='bandpass', output='sos')
     return sosfiltfilt(sos, signal)
 
-def notch_resp_harmonics(signal, fs, f_rr, max_harm=6, bw=0.06):
-    """
-    Rejet simple des harmoniques respiratoires.
-    """
+
+def notch_resp_harmonics(signal, fs, f_rr, max_harm=HR_MAX_HARM_REJECT, bw=0.05):
     x = np.asarray(signal, dtype=np.float64).copy()
 
     if not np.isfinite(f_rr) or f_rr <= 0:
@@ -206,6 +294,7 @@ def notch_resp_harmonics(signal, fs, f_rr, max_harm=6, bw=0.06):
 
     return x
 
+
 # =========================
 # Spectre et tracking
 # =========================
@@ -223,13 +312,28 @@ def puissance_spectre(x, fs, nfft=None, window="hann"):
     f = np.fft.rfftfreq(nfft, d=1.0 / fs)
     return f, Pxx
 
-def qualite_pics(frequence, Pxx, fmin, fmax):
+
+def harmonic_penalty(f0, rr_hz, max_harm=HR_MAX_HARM_REJECT, tol_hz=HR_HARM_PENALTY_HZ):
+    if not np.isfinite(f0) or not np.isfinite(rr_hz) or rr_hz <= 0:
+        return 0.0
+
+    penalty = 0.0
+    for k in range(2, max_harm + 1):
+        harm = k * rr_hz
+        d = abs(f0 - harm)
+        if d < tol_hz:
+            penalty = max(penalty, 1.0 - d / tol_hz)
+    return float(np.clip(penalty, 0.0, 1.0))
+
+
+def qualite_pics(frequence, Pxx, fmin, fmax, rr_hz=np.nan, top_n=HR_MULTI_PEAKS):
     bande = (frequence >= fmin) & (frequence <= fmax)
     frequence_bande = frequence[bande]
     Pxx_bande = Pxx[bande]
 
     if Pxx_bande.size == 0:
-        return np.nan, np.nan, 0.0
+        info = {"best_penalty": 0.0, "candidates": []}
+        return np.nan, np.nan, 0.0, info
 
     prom_min = 0.08 * np.max(Pxx_bande)
     pics, propriete = find_peaks(Pxx_bande, prominence=prom_min)
@@ -240,21 +344,40 @@ def qualite_pics(frequence, Pxx, fmin, fmax):
         frequence_pic = frequence_bande[k]
         pic_pow = Pxx_bande[k] + 1e-12
         SNR_db = 10.0 * np.log10(pic_pow / bruit)
-        return frequence_pic, SNR_db, 0.0
-
-    idx_best = np.argmax(Pxx_bande[pics])
-    k0 = pics[idx_best]
-    frequence_pic = frequence_bande[k0]
-    pic_pow = Pxx_bande[k0] + 1e-12
-    SNR_db = 10.0 * np.log10(pic_pow / bruit)
+        info = {"best_penalty": harmonic_penalty(frequence_pic, rr_hz), "candidates": [(frequence_pic, 1.0)]}
+        return frequence_pic, SNR_db, 0.0, info
 
     prominences = propriete["prominences"]
-    prom = float(prominences[idx_best])
-    prominence_norm = prom / pic_pow
+    peak_powers = Pxx_bande[pics] + 1e-12
+    power_norm = peak_powers / (np.max(peak_powers) + 1e-12)
+    prom_norm = prominences / (np.max(prominences) + 1e-12)
 
-    return frequence_pic, SNR_db, prominence_norm
+    candidates = []
+    for i, p_idx in enumerate(pics):
+        f0 = float(frequence_bande[p_idx])
+        pwr = float(peak_powers[i])
+        snr_db = 10.0 * np.log10(pwr / bruit)
+        pnorm = float(prominences[i] / pwr)
+        hpen = harmonic_penalty(f0, rr_hz)
+        score = (0.62 * power_norm[i]) + (0.38 * prom_norm[i]) - (HR_HARM_PENALTY_GAIN * hpen)
+        candidates.append({
+            "freq": f0,
+            "snr": float(snr_db),
+            "prom": float(pnorm),
+            "penalty": float(hpen),
+            "score": float(score),
+        })
 
-def FFT_glissante(x, freq, freq_min, freq_max, duree_fenetre=20.0):
+    candidates.sort(key=lambda d: d["score"], reverse=True)
+    best = candidates[0]
+    info = {
+        "best_penalty": best["penalty"],
+        "candidates": [(c["freq"], c["score"]) for c in candidates[:top_n]]
+    }
+    return best["freq"], best["snr"], best["prom"], info
+
+
+def FFT_glissante(x, freq, freq_min, freq_max, duree_fenetre=20.0, rr_hz=np.nan, top_n=HR_MULTI_PEAKS):
     x = np.asarray(x, dtype=np.float64)
     N = x.size
     fen = int(round(duree_fenetre * freq))
@@ -268,42 +391,51 @@ def FFT_glissante(x, freq, freq_min, freq_max, duree_fenetre=20.0):
     frequence_pic = []
     decibel_SNR = []
     prominence = []
+    penalties = []
+    candidate_snapshots = []
 
     i = 0
     while i + fen <= N:
         segment = x[i:i + fen]
         freqs, Pxx = puissance_spectre(segment, freq, nfft=4 * fen, window="hann")
-        f_pic, SNR_db, prom = qualite_pics(freqs, Pxx, freq_min, freq_max)
+        f_pic, SNR_db, prom, info = qualite_pics(freqs, Pxx, freq_min, freq_max, rr_hz=rr_hz, top_n=top_n)
         temps_centre.append((i + fen / 2) / freq)
         frequence_pic.append(f_pic)
         decibel_SNR.append(SNR_db)
         prominence.append(prom)
+        penalties.append(info.get("best_penalty", 0.0))
+        candidate_snapshots.append(info.get("candidates", []))
         i += hop
 
     return (
         np.array(temps_centre),
         np.array(frequence_pic),
         np.array(decibel_SNR),
-        np.array(prominence)
+        np.array(prominence),
+        np.array(penalties),
+        candidate_snapshots,
     )
 
-def tracking_freq(freq_est, snr_db, prom_norm, saut_max=0.15, alph=0.3, snr_min=3.0, prom_min=0.02):
+
+def tracking_freq(freq_est, snr_db, prom_norm, penalties=None, saut_max=0.15, alph=0.3, snr_min=3.0, prom_min=0.02):
     f_est = np.asarray(freq_est, dtype=np.float64)
     snr_db = np.asarray(snr_db, dtype=np.float64)
     prom_norm = np.asarray(prom_norm, dtype=np.float64)
+    penalties = np.asarray(penalties if penalties is not None else np.zeros_like(f_est), dtype=np.float64)
 
     f_track = np.full_like(f_est, np.nan)
     f_prev = np.nan
 
     for k in range(f_est.size):
         f = f_est[k]
-        ok = np.isfinite(f) and snr_db[k] >= snr_min and prom_norm[k] >= prom_min
+        ok = np.isfinite(f) and snr_db[k] >= snr_min and prom_norm[k] >= prom_min and penalties[k] < 0.85
         if not ok:
             continue
 
         if np.isfinite(f_prev):
-            if abs(f - f_prev) > saut_max:
-                continue
+            delta = abs(f - f_prev)
+            if delta > saut_max:
+                f = 0.72 * f_prev + 0.28 * f
             f_lisse = (1 - alph) * f_prev + alph * f
         else:
             f_lisse = f
@@ -313,22 +445,25 @@ def tracking_freq(freq_est, snr_db, prom_norm, saut_max=0.15, alph=0.3, snr_min=
 
     return f_track
 
+
 # =========================
 # Estimation RR / HR
 # =========================
 def estimation_rr(signal_rr, fs, duree_fenetre=20.0):
-    t, f, snr, prom = FFT_glissante(
+    t, f, snr, prom, penalties, candidates = FFT_glissante(
         signal_rr, fs,
         freq_min=RR_MIN_HZ,
         freq_max=RR_MAX_HZ,
-        duree_fenetre=duree_fenetre
+        duree_fenetre=duree_fenetre,
+        rr_hz=np.nan,
+        top_n=1,
     )
-    f_tr = tracking_freq(f, snr, prom, saut_max=0.05, alph=0.20, snr_min=3.0, prom_min=0.02)
+    f_tr = tracking_freq(f, snr, prom, penalties=penalties, saut_max=0.05, alph=0.20, snr_min=3.0, prom_min=0.02)
     rpm = f_tr * 60.0
     return t, rpm, snr, prom, f_tr
 
-def estimation_hr(signal_hr, fs, hr_prev_hz=None, duree_fenetre=18.0):
-    # 1) Bande adaptative
+
+def estimation_hr(signal_hr, fs, hr_prev_hz=None, rr_hz=np.nan, duree_fenetre=18.0):
     if hr_prev_hz is not None and np.isfinite(hr_prev_hz):
         fmin = max(HR_MIN_HZ, hr_prev_hz - HR_HALF_BAND_HZ)
         fmax = min(HR_MAX_HZ, hr_prev_hz + HR_HALF_BAND_HZ)
@@ -336,37 +471,38 @@ def estimation_hr(signal_hr, fs, hr_prev_hz=None, duree_fenetre=18.0):
         fmin = HR_MIN_HZ
         fmax = HR_MAX_HZ
 
-    # Sécurité sur bande trop étroite
     if (fmax - fmin) < 0.35:
         centre = hr_prev_hz if (hr_prev_hz is not None and np.isfinite(hr_prev_hz)) else 1.5
         fmin = max(HR_MIN_HZ, centre - 0.20)
         fmax = min(HR_MAX_HZ, centre + 0.20)
 
-    # 2) Essai en bande adaptative
-    t, f, snr, prom = FFT_glissante(
+    t, f, snr, prom, penalties, candidates = FFT_glissante(
         signal_hr, fs,
         freq_min=fmin,
         freq_max=fmax,
-        duree_fenetre=duree_fenetre
+        duree_fenetre=duree_fenetre,
+        rr_hz=rr_hz,
+        top_n=HR_MULTI_PEAKS,
     )
     f_tr = tracking_freq(
-        f, snr, prom,
+        f, snr, prom, penalties=penalties,
         saut_max=HR_HARD_JUMP_HZ,
         alph=HR_ALPHA_TRACK,
         snr_min=HR_SNR_MIN,
         prom_min=HR_PROM_MIN
     )
 
-    # 3) Fallback large bande si tout est NaN
     if np.all(~np.isfinite(f_tr)):
-        t, f, snr, prom = FFT_glissante(
+        t, f, snr, prom, penalties, candidates = FFT_glissante(
             signal_hr, fs,
             freq_min=HR_MIN_HZ,
             freq_max=HR_MAX_HZ,
-            duree_fenetre=duree_fenetre
+            duree_fenetre=duree_fenetre,
+            rr_hz=rr_hz,
+            top_n=HR_MULTI_PEAKS,
         )
         f_tr = tracking_freq(
-            f, snr, prom,
+            f, snr, prom, penalties=penalties,
             saut_max=0.18,
             alph=0.20,
             snr_min=2.0,
@@ -374,7 +510,8 @@ def estimation_hr(signal_hr, fs, hr_prev_hz=None, duree_fenetre=18.0):
         )
 
     bpm = f_tr * 60.0
-    return t, bpm, snr, prom, f_tr
+    return t, bpm, snr, prom, f_tr, penalties, candidates
+
 
 def filtre_mediane_simple(valeurs):
     vals = [v for v in valeurs if np.isfinite(v)]
@@ -382,27 +519,24 @@ def filtre_mediane_simple(valeurs):
         return np.nan
     return float(np.median(vals))
 
-def adaptive_alpha(hr_candidat, hr_precedent, snr):
-    if not np.isfinite(snr):
-        snr = 0.0
 
-    alpha_snr = 0.10 + 0.20 * np.clip((snr - 2.0) / 8.0, 0.0, 1.0)
+def adaptive_alpha(hr_prev, hr_med, snr_db, penalty, persistent_count):
+    alpha = HR_EMA_ALPHA
 
-    if not np.isfinite(hr_precedent):
-        return 0.35
+    if np.isfinite(snr_db):
+        alpha += 0.015 * np.clip(snr_db - 4.0, 0.0, 8.0)
 
-    delta = abs(hr_candidat - hr_precedent)
+    if np.isfinite(hr_prev) and np.isfinite(hr_med):
+        delta = abs(hr_med - hr_prev)
+        if delta > HR_CATCHUP_DELTA_BPM:
+            alpha = max(alpha, 0.34)
+        if persistent_count >= HR_CATCHUP_STREAK:
+            alpha = max(alpha, HR_CATCHUP_ALPHA)
 
-    if delta < 1.5:
-        alpha_delta = 0.00
-    elif delta < 4.0:
-        alpha_delta = 0.08
-    elif delta < 8.0:
-        alpha_delta = 0.18
-    else:
-        alpha_delta = 0.30
+    if np.isfinite(penalty) and penalty > 0.30:
+        alpha *= max(0.35, 1.0 - 0.7 * penalty)
 
-    return float(np.clip(alpha_snr + alpha_delta, 0.08, 0.60))
+    return float(np.clip(alpha, 0.05, 0.70))
 
 
 # =========================
@@ -424,6 +558,7 @@ ax.set_ylim(-1, 1)
 histo_i = deque(maxlen=4000)
 histo_q = deque(maxlen=4000)
 
+
 # =========================
 # Buffers et états
 # =========================
@@ -442,78 +577,82 @@ beta_fs = 0.05
 idx_lock = None
 reacq_count = 0
 score_bins = None
+global_switch_streak = 0
+last_global_candidate = None
+last_local_best = None
+last_global_best = None
 
 hr_history = deque(maxlen=HR_MEDIAN_LEN)
 hr_last_stable_hz = np.nan
 hr_last_output = np.nan
-hr_invalid_count = 0
+hr_shift_streak = 0
+invalid_hr_streak = 0
 
-switch_candidate_idx = None
-switch_candidate_count = 0
 
 def init_score_bins(nbins):
     global score_bins
     if score_bins is None or len(score_bins) != nbins:
         score_bins = np.zeros(nbins, dtype=np.float64)
 
+
+
 def choisir_idx_stable(z_bin, idx_precedent):
-    global score_bins, switch_candidate_idx, switch_candidate_count
+    global score_bins, global_switch_streak, last_global_candidate, last_local_best, last_global_best
 
     amp = np.abs(z_bin)
     init_score_bins(len(amp))
-
-    # Score temporel lissé: base de décision plus stable qu'une amplitude instantanée
     score_bins = (1.0 - TARGET_SMOOTH_ALPHA) * score_bins + TARGET_SMOOTH_ALPHA * amp
 
     if idx_precedent is None:
-        idx0 = int(np.argmax(score_bins))
-        switch_candidate_idx = None
-        switch_candidate_count = 0
-        return idx0
+        best = int(np.argmax(score_bins))
+        last_local_best = best
+        last_global_best = best
+        return best
 
     n = len(score_bins)
-    idx_precedent = int(np.clip(idx_precedent, 0, n - 1))
-    prev_score = float(score_bins[idx_precedent]) + 1e-12
+    left = max(0, idx_precedent - TARGET_LOCAL_MARGIN)
+    right = min(n, idx_precedent + TARGET_LOCAL_MARGIN + 1)
 
-    # 1) Recherche locale prioritaire autour du bin courant pour éviter les sauts larges
-    left = max(0, idx_precedent - TARGET_LOCAL_SEARCH_RADIUS)
-    right = min(n, idx_precedent + TARGET_LOCAL_SEARCH_RADIUS + 1)
     idx_local = left + int(np.argmax(score_bins[left:right]))
-    local_score = float(score_bins[idx_local])
-
-    if idx_local != idx_precedent and local_score >= TARGET_SWITCH_RATIO * prev_score:
-        idx_precedent = idx_local
-        prev_score = local_score
-
-    # 2) Ré-acquisition globale uniquement si le bin courant se dégrade vraiment
     idx_global = int(np.argmax(score_bins))
-    global_score = float(score_bins[idx_global])
+    last_local_best = idx_local
+    last_global_best = idx_global
 
-    prev_raw = float(amp[idx_precedent]) + 1e-12
-    global_raw = float(amp[idx_global]) + 1e-12
+    prev_score = score_bins[idx_precedent] + 1e-12
+    local_score = score_bins[idx_local]
+    global_score = score_bins[idx_global]
 
-    strong_global = (
-        abs(idx_global - idx_precedent) > TARGET_LOCAL_SEARCH_RADIUS and
-        global_score >= TARGET_REACQ_RATIO * prev_score and
-        prev_raw <= TARGET_DROP_RATIO * global_raw
-    )
+    # priorité au voisinage tant qu'il reste compétitif
+    if local_score >= 0.92 * prev_score:
+        global_switch_streak = 0
+        last_global_candidate = None
+        return idx_local
 
-    if strong_global:
-        if switch_candidate_idx == idx_global:
-            switch_candidate_count += 1
+    # si le global est lointain, on demande confirmation sur plusieurs trames
+    far_jump = abs(idx_global - idx_precedent) > TARGET_FAR_JUMP_MAX
+    strong_global = global_score >= TARGET_SWITCH_RATIO * max(local_score, prev_score)
+
+    if far_jump and strong_global:
+        if last_global_candidate == idx_global:
+            global_switch_streak += 1
         else:
-            switch_candidate_idx = idx_global
-            switch_candidate_count = 1
+            last_global_candidate = idx_global
+            global_switch_streak = 1
 
-        if switch_candidate_count >= TARGET_SWITCH_HOLD:
-            idx_precedent = idx_global
-            switch_candidate_idx = None
-            switch_candidate_count = 0
-    else:
-        switch_candidate_idx = None
-        switch_candidate_count = 0
+        if global_switch_streak >= TARGET_GLOBAL_CONFIRM:
+            global_switch_streak = 0
+            last_global_candidate = None
+            return idx_global
+        return idx_precedent
 
-    return int(idx_precedent)
+    global_switch_streak = 0
+    last_global_candidate = None
+
+    if local_score >= prev_score:
+        return idx_local
+
+    return idx_precedent
+
 
 # =========================
 # Boucle principale
@@ -529,26 +668,23 @@ try:
         Q_brut = np.asarray(tableau_IQ[1], dtype=np.float64)
         z_bin = I_brut + 1j * Q_brut
 
-        # Verrouillage de cible plus stable
         if idx_lock is None or reacq_count >= TARGET_REACQ_PERIOD:
             init_score_bins(len(z_bin))
             score_bins = np.abs(z_bin).astype(np.float64)
             idx_lock = int(np.argmax(score_bins))
             reacq_count = 0
+            global_switch_streak = 0
         else:
             idx_lock = choisir_idx_stable(z_bin, idx_lock)
 
         reacq_count += 1
 
-        # Moyenne locale autour du bin verrouillé
         left = max(0, idx_lock - TARGET_NEIGHBOR_MARGIN)
         right = min(len(z_bin), idx_lock + TARGET_NEIGHBOR_MARGIN + 1)
         z_roi = z_bin[left:right]
-        amp_roi = np.abs(z_roi)
-        # Pondération locale: réduit la sensibilité à un voisin faible sans perdre la continuité
-        weights = 0.25 + amp_roi
-        weights = weights / (np.sum(weights) + 1e-12)
-        z_sel = np.sum(z_roi * weights)
+        roi_amp = np.abs(z_roi)
+        roi_w = roi_amp / (np.sum(roi_amp) + 1e-12)
+        z_sel = np.sum(z_roi * roi_w)
 
         I_sel = float(np.real(z_sel))
         Q_sel = float(np.imag(z_sel))
@@ -569,7 +705,6 @@ try:
         fig.canvas.flush_events()
         plt.pause(0.001)
 
-        # Phase physiologique
         I_phase, Q_phase = pretraitement_phase(I_sel, Q_sel)
         phase = np.arctan2(Q_phase, I_phase)
         phase_deplie_val = unwrap_phase(phase)
@@ -578,18 +713,15 @@ try:
         buffer_temps.append(t_now)
         buffer_phi.append(phase_deplie_val)
 
-        # Estimation fs lissée
         if len(buffer_temps) >= 2:
             dt_last = buffer_temps[-1] - buffer_temps[-2]
             fs_inst = 1.0 / max(dt_last, 1e-6)
             fs_est = fs_inst if fs_est is None else (1 - beta_fs) * fs_est + beta_fs * fs_inst
 
-        # Fenêtre glissante
         while (buffer_temps[-1] - buffer_temps[0]) > seconde_fenetre:
             buffer_temps.popleft()
             buffer_phi.popleft()
 
-        # Traitement fréquentiel
         if len(buffer_phi) >= echantillon_min:
             tab_phi = np.array(buffer_phi, dtype=np.float64)
 
@@ -600,10 +732,9 @@ try:
                 dt = np.diff(tab_t)
                 fs = 1.0 / np.median(dt)
 
-            # Passe-haut lent
             phi_hp = filtre_pass_haut(tab_phi, fs, fc=0.05)
 
-            # RR
+            rr_snr_out = np.nan
             try:
                 sig_rr = passe_bande(phi_hp, RR_MIN_HZ, RR_MAX_HZ, fs)
                 t_rr, rr_rpm, rr_snr, rr_prom, rr_f = estimation_rr(sig_rr, fs, duree_fenetre=20.0)
@@ -612,26 +743,32 @@ try:
 
                 rr_f_val = rr_f[np.isfinite(rr_f)]
                 rr_f_out = rr_f_val[-1] if rr_f_val.size else np.nan
+
+                rr_snr_val = rr_snr[np.isfinite(rr_snr)]
+                rr_snr_out = rr_snr_val[-1] if rr_snr_val.size else np.nan
             except Exception:
                 rr_out = np.nan
                 rr_f_out = np.nan
 
-            # Dérivée de phase pour accentuer HR
             phi_diff = np.diff(phi_hp, prepend=phi_hp[0])
 
             try:
                 sig_hr = passe_bande(phi_diff, HR_MIN_HZ, HR_MAX_HZ, fs)
-                sig_hr = notch_resp_harmonics(sig_hr, fs, rr_f_out, max_harm=5, bw=0.06)
+                sig_hr = notch_resp_harmonics(sig_hr, fs, rr_f_out, max_harm=HR_MAX_HARM_REJECT, bw=0.05)
             except Exception:
                 sig_hr = phi_diff.copy()
 
             if (t_now - marqueur_print) > affichage:
                 hr_prev = hr_last_stable_hz if np.isfinite(hr_last_stable_hz) else None
+                hr_candidates_log = []
+                hr_best_penalty = np.nan
+                hr_med = np.nan
 
                 try:
-                    t_hr, hr_bpm, hr_snr, hr_prom, hr_f = estimation_hr(
+                    t_hr, hr_bpm, hr_snr, hr_prom, hr_f, hr_penalties, hr_candidates = estimation_hr(
                         sig_hr, fs,
                         hr_prev_hz=hr_prev,
+                        rr_hz=rr_f_out,
                         duree_fenetre=18.0
                     )
 
@@ -639,49 +776,94 @@ try:
                     hr_f_val = hr_f[np.isfinite(hr_f)]
                     hr_snr_val = hr_snr[np.isfinite(hr_snr)]
                     hr_prom_val = hr_prom[np.isfinite(hr_prom)]
+                    hr_pen_val = hr_penalties[np.isfinite(hr_penalties)]
 
                     hr_out_raw = hr_val[-1] if hr_val.size else np.nan
                     hr_f_out = hr_f_val[-1] if hr_f_val.size else np.nan
                     hr_snr_out = hr_snr_val[-1] if hr_snr_val.size else np.nan
                     hr_prom_out = hr_prom_val[-1] if hr_prom_val.size else np.nan
+                    hr_best_penalty = hr_pen_val[-1] if hr_pen_val.size else np.nan
+                    hr_candidates_log = hr_candidates[-1] if len(hr_candidates) else []
                 except Exception:
                     hr_out_raw = np.nan
                     hr_f_out = np.nan
                     hr_snr_out = np.nan
                     hr_prom_out = np.nan
 
-                # Mise à jour robuste: médiane courte + EMA adaptative pour éviter la stagnation
                 if np.isfinite(hr_out_raw):
-                    hr_invalid_count = 0
+                    invalid_hr_streak = 0
                     hr_history.append(hr_out_raw)
                     hr_med = filtre_mediane_simple(hr_history)
 
                     if np.isfinite(hr_med):
                         if np.isfinite(hr_last_output):
-                            alpha_hr = adaptive_alpha(hr_med, hr_last_output, hr_snr_out)
-                            hr_last_output = (1.0 - alpha_hr) * hr_last_output + alpha_hr * hr_med
+                            if abs(hr_med - hr_last_output) > HR_CATCHUP_DELTA_BPM:
+                                hr_shift_streak += 1
+                            else:
+                                hr_shift_streak = 0
+
+                            alpha = adaptive_alpha(hr_last_output, hr_med, hr_snr_out, hr_best_penalty, hr_shift_streak)
+                            hr_last_output = (1.0 - alpha) * hr_last_output + alpha * hr_med
                         else:
                             hr_last_output = hr_med
+                            hr_shift_streak = 0
 
                         hr_last_stable_hz = hr_last_output / 60.0
                 else:
-                    hr_invalid_count += 1
-                    # Après plusieurs mesures invalides, on évite de rester figé trop longtemps
-                    if hr_invalid_count >= 5:
+                    invalid_hr_streak += 1
+                    if invalid_hr_streak >= HR_MAX_INVALID_STREAK:
                         hr_history.clear()
-                        hr_last_stable_hz = np.nan
+                        hr_shift_streak = 0
+                        if np.isfinite(hr_last_output):
+                            hr_last_output = 0.92 * hr_last_output + 0.08 * (60.0 * hr_last_stable_hz if np.isfinite(hr_last_stable_hz) else hr_last_output)
 
                 hr_print = hr_last_output if np.isfinite(hr_last_output) else np.nan
+
+                cand_bpm_score = []
+                for freq_c, score_c in hr_candidates_log[:HR_MULTI_PEAKS]:
+                    cand_bpm_score.append((60.0 * freq_c, score_c))
+                while len(cand_bpm_score) < HR_MULTI_PEAKS:
+                    cand_bpm_score.append((np.nan, np.nan))
 
                 print(
                     f"RR: {rr_out:.2f} rpm | "
                     f"HR: {hr_print:.2f} bpm | "
                     f"HR_brut: {hr_out_raw:.2f} bpm | "
+                    f"HR_med: {hr_med:.2f} bpm | "
                     f"SNR_HR: {hr_snr_out:.2f} dB | "
                     f"PROM_HR: {hr_prom_out:.4f} | "
+                    f"PEN_HR: {hr_best_penalty:.2f} | "
                     f"HR_ref_hz: {hr_last_stable_hz:.3f} | "
                     f"bin: {idx_lock}"
                 )
+
+                write_log([
+                    t_now,
+                    fs,
+                    idx_lock,
+                    last_local_best,
+                    last_global_best,
+                    rr_out,
+                    rr_f_out,
+                    rr_snr_out,
+                    hr_print,
+                    hr_out_raw,
+                    hr_med,
+                    hr_f_out,
+                    hr_snr_out,
+                    hr_prom_out,
+                    hr_best_penalty,
+                    cand_bpm_score[0][0],
+                    cand_bpm_score[0][1],
+                    cand_bpm_score[1][0],
+                    cand_bpm_score[1][1],
+                    cand_bpm_score[2][0],
+                    cand_bpm_score[2][1],
+                    phase_deplie_val,
+                    float(np.abs(z_bin[idx_lock])) if 0 <= idx_lock < len(z_bin) else np.nan,
+                    reacq_count,
+                    invalid_hr_streak,
+                ])
 
                 marqueur_print = t_now
 
